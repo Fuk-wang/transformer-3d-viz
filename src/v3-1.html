@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPT 与 Transformer 架构可视化 · 敦煌双视图</title>
+<!--
+  ===========================================================================
+  GPT 与 Transformer 架构可视化 —— 单文件教学页（敦煌双视图 v3）
+  ---------------------------------------------------------------------------
+  这一版把两套呈现放在同一个页面里，右上/底部一键切换：
+
+    ① 结构框图（tower）  网络模块塔 + 张量方块一格一格往上搬
+    ② 向量解剖（anatomy）每个 token 一颗发光的词球，注意力用弧线相连，
+                         残差流是一根根竖梁，一层层往上长
+
+  皮肤沿用“敦煌 v1”：近黑底 + 石青 / 石绿 / 金线 / 朱砂 + 宋体，
+  两套视图共用一套配色、一套 12 步叙事、一套固定可复现的注意力演示数值。
+
+  怎么读这份代码（面向自学）：
+    §1  <style>      界面样式（敦煌配色 / 面板 / 表格 / 公式排版）
+    §2  DOM          画布 + 3D 投影文字层 + 阶段表 + 讲解面板 + 控制条 + 浮层
+    §3  数据与数学     真实 GPT-2 权重查表、真实下一词分布、掩码与 softmax
+    §4  WebGL 渲染器   盒体 / 细梁 / 网格 / 球体 / 弧形光带
+    §5  解剖视图       词球、残差竖梁、注意力弧、藻井地纹
+    §6  场景与动画     两种视图的分派、张量搬家状态机、相机、交互
+
+  想改哪里：搜「★」。
+  ===========================================================================
+-->
+<style>
+/* ============================ 1. 基础与配色（敦煌） ============================ */
+:root{
+  --void:#08060e;
+  --lapis:#16224a;          /* 石青（青金） */
+  --lapis-lt:#5b86d6;       /* 亮石青：数据 / 链接 / 数字 */
+  --lapis-pale:#a8c4f0;
+  --gold:#d9b56a;           /* 金线 */
+  --gold-lt:#f4e2b4;
+  --cin:#c8402f;            /* 朱砂：强调 / 掩码 */
+  --cin-lt:#e7765c;
+  --mal:#2f9e86;            /* 石绿：新生成的 token */
+  --mal-lt:#67d3b6;
+  --ink:#efe4cb;            /* 纸色文字 */
+  --dim:rgba(239,228,203,.58);
+  --faint:rgba(239,228,203,.3);
+  --hair:rgba(217,181,106,.24);
+  --hair-2:rgba(217,181,106,.5);
+  --panel:linear-gradient(180deg,rgba(24,20,34,.9),rgba(10,8,16,.93));
+  --panel-2:linear-gradient(180deg,rgba(28,23,38,.96),rgba(10,8,16,.97));
+  --serif:"Songti SC","Source Han Serif SC","Noto Serif CJK SC","STSong",SimSun,"Times New Roman",serif;
+  --mono:"Cascadia Mono",Consolas,"Courier New",monospace;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;margin:0;overflow:hidden}
+body{
+  background:
+    radial-gradient(1150px 700px at 50% -12%, #1b2547 0%, #101433 42%, #08060e 78%),
+    radial-gradient(760px 560px at 96% 106%, rgba(200,64,47,.13), transparent 70%),
+    radial-gradient(620px 460px at 4% 92%, rgba(47,158,134,.09), transparent 72%),
+    #08060e;
+  color:var(--ink);font-family:var(--serif);font-size:13px;
+  -webkit-font-smoothing:antialiased;
+}
+canvas#gl{position:fixed;inset:0;width:100%;height:100%;display:block;cursor:grab}
+canvas#gl.dragging{cursor:grabbing}
+/* 3D 里投影出来的文字：DOM 叠在画布上，中文永远清晰 */
+#labels{position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:2}
+.lbl{position:absolute;left:0;top:0;white-space:nowrap;transform-origin:50% 50%;
+     will-change:transform,opacity;transition:opacity .16s linear;
+     text-shadow:0 1px 4px #000,0 0 12px rgba(0,0,0,.95)}
+.lbl-mod{font-size:12.5px;letter-spacing:.06em;color:rgba(239,228,203,.86)}
+.lbl-mod.on{color:#1a1206;background:linear-gradient(180deg,var(--gold-lt),var(--gold));
+  padding:1px 7px;border-radius:1px;font-weight:700}
+.lbl-shape{font-family:var(--mono);font-size:10.5px;color:rgba(168,196,240,.82);
+  background:rgba(8,6,14,.72);padding:0 4px;border-radius:1px;border:1px solid rgba(91,134,214,.26)}
+.lbl-tok{font-size:12.5px;color:var(--ink);background:rgba(8,6,14,.6);
+  padding:1px 6px;border-radius:1px;border:1px solid var(--hair)}
+.lbl-tok.gen{border-color:rgba(103,211,182,.55);color:#c9ffe9}
+.lbl-tiny{font-family:var(--mono);font-size:10px;color:rgba(239,228,203,.5)}
+.lbl-note{font-size:11px;letter-spacing:.14em;color:rgba(217,181,106,.88)}
+.lbl-layer{font-size:11.5px;letter-spacing:.2em;color:rgba(244,226,180,.78)}
+.lbl-sphere{font-size:13px;color:var(--ink);background:rgba(8,6,14,.62);
+  padding:1px 7px;border:1px solid var(--hair)}
+.lbl-sphere.q{color:#1a1206;background:linear-gradient(180deg,var(--gold-lt),var(--gold));
+  border-color:var(--gold-lt)}
+.lbl-gate{font-size:11px;letter-spacing:.10em;color:rgba(244,226,180,.80);
+  background:rgba(8,6,14,.5);padding:0 5px;border-left:2px solid rgba(217,181,106,.55)}
+.lbl-head{font-family:var(--mono);font-size:10px;color:rgba(168,196,240,.72);letter-spacing:.06em}
+
+/* ============================ 2. 顶部标题 ============================ */
+#hud{position:fixed;left:22px;top:16px;z-index:6;pointer-events:none}
+#hud h1{margin:0;font-size:19px;font-weight:400;letter-spacing:.06em;
+  background:linear-gradient(92deg,#f7eed8 0%,#f0dcae 46%,#d9b56a 100%);
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+#hud h1 b{font-weight:400}
+#hud h1 em{font-style:normal;-webkit-text-fill-color:var(--cin-lt);color:var(--cin-lt)}
+#hud p{margin:6px 0 0;font-size:11.5px;color:var(--dim);letter-spacing:.09em}
+#hud .tag{display:inline-block;margin-right:7px;padding:1px 6px;border:1px solid var(--hair);
+  border-radius:1px;font-family:var(--mono);font-size:10px;color:var(--gold-lt)}
+
+/* ============================ 3. 左侧阶段表 ============================ */
+#stageList{position:fixed;left:22px;top:92px;z-index:6;width:184px;
+  background:var(--panel);border:1px solid var(--hair);border-radius:1px;
+  padding:9px 6px 8px;backdrop-filter:blur(8px);max-height:calc(100vh - 226px);overflow:auto;
+  box-shadow:0 24px 60px -34px #000}
+#stageList::after{content:'';position:absolute;inset:3px;border:1px solid rgba(217,181,106,.1);
+  pointer-events:none}
+#stageList .hd{font-size:9.5px;letter-spacing:.34em;color:var(--faint);
+  padding:2px 8px 8px;font-family:var(--mono)}
+#stageList button{display:block;width:100%;text-align:left;background:none;border:0;
+  color:var(--dim);font:inherit;font-size:11.5px;padding:5px 8px 5px 9px;cursor:pointer;
+  border-left:2px solid transparent;line-height:1.4}
+#stageList button:hover{color:var(--ink);background:rgba(217,181,106,.06)}
+#stageList button .n{font-family:var(--mono);font-size:9.5px;color:var(--faint);margin-right:6px}
+#stageList button.on{color:var(--gold-lt);background:rgba(200,64,47,.13);border-left-color:var(--cin)}
+#stageList button.on .n{color:var(--cin-lt)}
+
+/* ============================ 4. 右侧讲解面板 ============================ */
+#side{position:fixed;right:20px;top:16px;bottom:104px;width:330px;z-index:6;
+  display:flex;flex-direction:column;gap:10px;overflow:auto;padding-right:2px;
+  scrollbar-width:thin;scrollbar-color:rgba(217,181,106,.4) transparent}
+#side::-webkit-scrollbar{width:6px}
+#side::-webkit-scrollbar-thumb{background:rgba(217,181,106,.35)}
+.card{position:relative;background:var(--panel);border:1px solid var(--hair);
+  padding:12px 14px;backdrop-filter:blur(8px);box-shadow:0 24px 60px -34px #000}
+.card::before{content:'';position:absolute;inset:3px;border:1px solid rgba(217,181,106,.09);
+  pointer-events:none}
+.card::after{content:'';position:absolute;inset:-1px;pointer-events:none;opacity:.8;background:
+  linear-gradient(var(--gold),var(--gold)) 0 0/13px 1px no-repeat,
+  linear-gradient(var(--gold),var(--gold)) 0 0/1px 13px no-repeat,
+  linear-gradient(var(--gold),var(--gold)) 100% 100%/13px 1px no-repeat,
+  linear-gradient(var(--gold),var(--gold)) 100% 100%/1px 13px no-repeat}
+.card h2{margin:0 0 8px;font-size:13px;font-weight:400;letter-spacing:.06em;
+  display:flex;align-items:center;gap:7px;color:var(--gold-lt)}
+.card h2 .badge{font-family:var(--mono);font-size:9.5px;color:var(--cin-lt);
+  border:1px solid rgba(200,64,47,.5);border-radius:1px;padding:0 4px;letter-spacing:.1em}
+.card p{margin:0 0 8px;font-size:12px;line-height:1.8;color:rgba(239,228,203,.82);letter-spacing:.01em}
+.card p:last-child{margin-bottom:0}
+.card p b{color:var(--gold-lt);font-weight:400}
+.card .k{color:var(--lapis-pale);font-family:var(--mono);font-size:11px}
+.card .warn{color:var(--cin-lt)}
+.card .ok{color:var(--mal-lt)}
+
+/* 形状流水线 */
+.shapes{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:2px 0 9px}
+.shapes .s{font-family:var(--mono);font-size:10.5px;color:var(--lapis-pale);
+  background:rgba(22,34,74,.55);border:1px solid rgba(91,134,214,.32);
+  padding:2px 6px;border-radius:1px}
+.shapes .ar{color:var(--faint);font-size:10px}
+.shapes .op{font-size:10.5px;color:var(--gold);font-family:var(--mono)}
+
+/* 公式（纯 HTML 排版，不引外部库） */
+.eq{margin:9px 0 4px;padding:11px 12px;background:rgba(217,181,106,.05);
+  border-left:2px solid var(--gold);font-family:"Cambria Math",Georgia,var(--serif);
+  font-size:15px;color:#f7eed8;overflow-x:auto}
+.eq .frac{display:inline-block;vertical-align:middle;text-align:center;margin:0 3px}
+.eq .frac .up{display:block;padding:0 4px 1px;border-bottom:1px solid rgba(217,181,106,.5)}
+.eq .frac .dn{display:block;padding:1px 4px 0}
+.eq sub,.eq sup{font-size:10px}
+.eq .mask{color:var(--cin-lt)}
+.eq-cap{font-size:10.5px;color:var(--faint);margin:0 0 6px;line-height:1.7}
+
+#sinkChart{margin:10px 0 2px;display:flex;align-items:flex-end;gap:2px;height:46px;position:relative}
+#sinkChart .b{flex:1;position:relative;background:linear-gradient(180deg,rgba(217,181,106,.55),rgba(217,181,106,.12));
+  min-height:2px;cursor:pointer}
+#sinkChart .b.on{background:linear-gradient(180deg,var(--cin-lt),rgba(200,64,47,.35));box-shadow:0 0 0 1px var(--cin-lt)}
+#sinkChart .b span{position:absolute;top:-14px;left:50%;transform:translateX(-50%);font-family:var(--mono);
+  font-size:8px;color:var(--faint)}
+#sinkChart .cap{font-size:9.5px;color:var(--faint);font-family:var(--mono);margin-top:4px;display:block}
+/* 注意力数值表 */
+table.attn{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:10px;margin-top:4px}
+table.attn th,table.attn td{padding:2px 1px;text-align:center;border:1px solid rgba(217,181,106,.12)}
+table.attn th{color:var(--faint);font-weight:400;font-size:9.5px}
+table.attn td.msk{color:rgba(231,118,92,.42);background:rgba(200,64,47,.07)}
+table.attn td.hot{background:rgba(217,181,106,.18);color:var(--gold-lt)}
+.legend{display:flex;gap:10px;font-size:10px;color:var(--faint);margin-top:7px;flex-wrap:wrap}
+.legend i{display:inline-block;width:8px;height:8px;border-radius:1px;margin-right:4px;vertical-align:middle}
+.headTabs,.qTabs{display:flex;gap:4px;margin:8px 0 2px;flex-wrap:wrap}
+.headTabs button,.qTabs button{flex:1 1 auto;min-width:34px;background:rgba(22,34,74,.5);
+  border:1px solid var(--hair);color:var(--dim);font:inherit;font-size:10.5px;
+  font-family:var(--mono);padding:3px 4px;cursor:pointer}
+.headTabs button.on,.qTabs button.on{background:rgba(217,181,106,.16);
+  border-color:var(--gold);color:var(--gold-lt)}
+
+/* 下一个词的概率条 */
+#probs{display:none}
+#probs.on{display:block}
+.prow{display:flex;align-items:center;gap:7px;margin:4px 0;font-size:11.5px}
+.prow .w{width:52px;text-align:right;color:var(--dim);font-family:var(--mono);font-size:11px}
+.prow .bar{flex:1;height:9px;background:rgba(91,134,214,.14);overflow:hidden}
+.prow .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,rgba(91,134,214,.7),var(--lapis-pale));
+  transition:width .45s cubic-bezier(.3,.9,.3,1)}
+.prow.top{color:var(--ink)}
+.prow.top .w{color:var(--gold-lt)}
+.prow.top .bar i{background:linear-gradient(90deg,rgba(217,181,106,.75),var(--gold-lt))}
+.prow .v{width:38px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--faint)}
+
+/* 底部公式条 */
+#eqBar{position:fixed;left:50%;transform:translateX(-50%);bottom:78px;z-index:6;
+  width:min(760px,calc(100vw - 420px));display:none;align-items:center;gap:18px;
+  padding:10px 18px;background:linear-gradient(180deg,rgba(26,21,36,.9),rgba(9,7,15,.94));
+  border:1px solid var(--hair);backdrop-filter:blur(8px)}
+#eqBar.on{display:flex}
+#eqBar::before{content:'';position:absolute;inset:3px;border:1px solid rgba(217,181,106,.10);pointer-events:none}
+#eqBar .cap{font-family:var(--mono);font-size:9px;letter-spacing:.26em;color:var(--faint);flex:0 0 auto}
+#eqBar .f{flex:1;text-align:center;font-family:"Cambria Math",Georgia,var(--serif);
+  font-size:20px;color:#f7eed8;white-space:nowrap}
+#eqBar .f .fr{display:inline-block;vertical-align:middle;text-align:center;margin:0 4px}
+#eqBar .f .fr .up{display:block;padding:0 5px 1px;border-bottom:1px solid rgba(217,181,106,.55)}
+#eqBar .f .fr .dn{display:block;padding:1px 5px 0}
+#eqBar .f .br{font-size:26px;color:var(--gold)}
+#eqBar .f .mk{color:var(--cin-lt)}
+#eqBar .f sub,#eqBar .f sup{font-size:11px}
+#eqBar .lh{font-family:var(--mono);font-size:10px;color:var(--gold-lt);letter-spacing:.1em;flex:0 0 auto}
+@media (max-width:1240px){#eqBar{display:none!important}}
+
+/* ============================ 5. 底部控制条 ============================ */
+#dock{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;z-index:7;
+  display:flex;align-items:center;gap:7px;padding:9px 12px;
+  background:var(--panel-2);border:1px solid var(--hair-2);
+  backdrop-filter:blur(10px);box-shadow:0 10px 40px rgba(0,0,0,.6)}
+#dock::before{content:'';position:absolute;inset:2px;border:1px solid rgba(217,181,106,.12);pointer-events:none}
+#dock button{background:rgba(217,181,106,.05);border:1px solid var(--hair);color:var(--ink);
+  font:inherit;font-size:11.5px;padding:5px 9px;cursor:pointer;
+  display:flex;align-items:center;gap:5px;white-space:nowrap;transition:background .16s,color .16s}
+#dock button:hover{background:rgba(217,181,106,.14);border-color:var(--hair-2)}
+#dock button.on{background:rgba(217,181,106,.2);border-color:var(--gold);color:var(--gold-lt)}
+#dock button.primary{background:linear-gradient(180deg,var(--gold-lt),var(--gold));
+  border-color:var(--gold-lt);color:#1a1206;min-width:74px;justify-content:center;font-weight:700}
+#dock button.primary:hover{filter:brightness(1.06)}
+#dock .sep{width:1px;height:22px;background:var(--hair)}
+#dock label{font-size:10.5px;color:var(--faint);display:flex;align-items:center;gap:5px}
+#dock input[type=range]{width:66px;accent-color:var(--gold)}
+#prog{width:132px;height:3px;background:rgba(217,181,106,.16);overflow:hidden}
+#prog i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--gold),var(--cin-lt))}
+#stepNo{font-family:var(--mono);font-size:10.5px;color:var(--dim);min-width:44px;text-align:center}
+/* 视图切换：两个一组的分段按钮 */
+.seg2{display:flex;border:1px solid var(--hair)}
+.seg2 button{border:0!important;background:transparent;padding:5px 10px!important}
+.seg2 button+button{border-left:1px solid var(--hair)!important}
+.seg2 button.on{background:linear-gradient(180deg,var(--gold-lt),var(--gold))!important;color:#1a1206!important}
+
+/* ============================ 6. 浮层（说明 / 架构总览） ============================ */
+.overlay{position:fixed;inset:0;z-index:20;display:none;background:rgba(4,3,8,.84);
+  backdrop-filter:blur(6px);overflow:auto;padding:44px 20px}
+.overlay.on{display:block}
+.sheet{max-width:920px;margin:0 auto;background:var(--panel-2);border:1px solid var(--hair-2);
+  padding:26px 30px;position:relative}
+.sheet::before{content:'';position:absolute;inset:5px;border:1px solid rgba(217,181,106,.14);pointer-events:none}
+.sheet h2{margin:0 0 4px;font-size:18px;font-weight:400;letter-spacing:.06em;color:var(--gold-lt)}
+.sheet .sub{color:var(--dim);font-size:12px;margin:0 0 18px}
+.sheet h3{margin:22px 0 8px;font-size:13px;color:var(--gold);letter-spacing:.1em;font-weight:400}
+.sheet p,.sheet li{font-size:12.5px;line-height:1.85;color:rgba(239,228,203,.84)}
+.sheet li{margin:4px 0}
+.sheet b{color:var(--gold-lt);font-weight:400}
+.sheet .close{position:sticky;top:0;float:right;background:rgba(217,181,106,.1);
+  border:1px solid var(--hair-2);color:var(--ink);font:inherit;font-size:12px;
+  padding:4px 10px;cursor:pointer}
+.arch{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin:12px 0 4px}
+.arch .col{border:1px solid var(--hair);padding:14px}
+.arch .col h4{margin:0 0 10px;font-size:12px;color:var(--gold-lt);font-weight:400;letter-spacing:.06em}
+.arch .stack{display:flex;flex-direction:column;gap:5px}
+.arch .blk{border:1px solid rgba(91,134,214,.3);padding:6px 9px;
+  font-size:11px;color:rgba(239,228,203,.82);background:rgba(22,34,74,.4)}
+.arch .blk.hi{border-color:rgba(217,181,106,.5);background:rgba(217,181,106,.09);color:var(--gold-lt)}
+.arch .blk.rep{color:var(--faint);text-align:center;font-family:var(--mono);font-size:10px;
+  border-style:dashed}
+.arch .note{font-size:11px;color:var(--dim);margin-top:9px;line-height:1.7}
+kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--hair-2);
+  border-bottom-width:2px;border-radius:1px;padding:1px 4px;color:var(--ink);background:rgba(217,181,106,.08)}
+
+/* 右下角图例 */
+#legendBox,#legendAnat{position:fixed;right:20px;bottom:18px;z-index:5;font-size:10px;color:var(--faint);
+  display:flex;gap:12px;align-items:center;pointer-events:none;flex-wrap:wrap;
+  max-width:330px;justify-content:flex-end}
+#legendAnat{display:none}
+#legendBox span,#legendAnat span{display:flex;align-items:center;gap:4px}
+#legendBox i,#legendAnat i{width:9px;height:9px;border-radius:1px;display:inline-block}
+
+/* 错误遮罩 */
+#fatal{position:fixed;inset:0;z-index:99;display:none;background:#0b0810;color:#ffc0b2;
+  font-family:var(--mono);font-size:12px;padding:40px;white-space:pre-wrap;line-height:1.7}
+#fatal.on{display:block}
+
+/* 窄屏 */
+@media (max-width:1240px){
+  #stageList{width:160px}
+  #side{width:300px}
+}
+@media (max-width:980px){
+  #stageList{display:none}
+  #side{display:none}
+  #legendBox,#legendAnat{display:none}
+  #hud h1{font-size:16px}
+  #dock{gap:5px;padding:7px 8px}
+  #dock button{font-size:10.5px;padding:4px 7px}
+  #prog{width:70px}
+}
+</style>
+</head>

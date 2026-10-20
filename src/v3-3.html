@@ -1,0 +1,211 @@
+/* =====================================================================
+   §3  数据与数学
+   ---------------------------------------------------------------------
+   ★ 这里的注意力权重是真实 GPT-2 small 的前向结果（REAL_ATTN，来自 v5-real.html），
+     不是随机数、不是手工偏置：12 层 × 12 头 × 5×5（含 6×6）全部查表得到。
+   ===================================================================== */
+
+/* ★ 模型规格：想演示更大的模型，改这里（画面上只画前 4 块） */
+const NTOK_PROMPT = 5;      // 提示词 token 数
+const NBLOCK      = 4;      // ★ 画面上画几个实体 Decoder 块
+const REAL_LAYERS = 12;     // ★ 真实层数（用于「×12」标签与参数统计）
+const NHEAD       = 12;     // ★ GPT-2 small 的真实头数（12 × 64 = 768）
+const NHEAD_DRAW  = 12;     // 12 个头全部画出来（数据是真的，没必要再挑代表）
+const DK          = 64;     // 每个头的维度
+const DMODEL      = 768;    // 模型维度（残差流的宽度）
+const DFF         = 3072;   // MLP 中间层维度 = 4×768
+const VOCAB       = 50257;  // 词表大小（GPT-2）
+
+/* ★ 演示用的提示词 + 自回归要吐出来的词。改成别的句子就是另一个例子。 */
+/* ★ 演示句：必须用真实 GPT-2 能切成 5 个 token 的英文句；中文在这台上是 20 个字节片段 */
+const PROMPT_TOKENS = ['G', 'PT', ' is', ' a', ' language'];
+const GEN_REAL = ' that';   // 真模型给出的下一个词（18.0%）
+/* 每一步「预测下一个词」的分布由这里决定：第 1 个是模型选中的词，后面是陪跑的候选。
+   p 是它给出的概率，其余候选的概率写在 d 里 —— 合起来 < 1，剩下的概率归给「词表里其他 5 万个词」。 */
+/* 旧的 GEN_PLAN 手写概率表已删除：概率现在直接读真模型分布（见 realBundle().next） */
+const MAX_TOKENS = 6;       // 真数据只算了 5 和 6 个 token 两种长度，接一个词就重置
+
+/* ---------- 确定性随机数（同一个种子 → 每次打开完全一样） ---------- */
+function mulberry32(seed){
+  let a = seed >>> 0;
+  return function(){
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+/* 两个数揉成一个种子，保证 (层,头,行,列) 每个组合的噪声都不同又固定 */
+function seedOf(a, b, c, d){
+  return (Math.imul(a + 1, 2654435761) ^ Math.imul(b + 1, 40503) ^
+          Math.imul(c + 1, 2246822519) ^ Math.imul(d + 1, 3266489917)) >>> 0;
+}
+
+/* ---------- 语义分组：只影响「语义头」偏向哪些词 ---------- */
+function groupOf(tok){
+  if (['GPT','语言','模型','Decoder','Transformer','注意力','编码器'].indexOf(tok) >= 0) return 1; // 术语/名词
+  if (['是','由','用','基于','把','和','的','一种'].indexOf(tok) >= 0) return 2;                 // 虚词
+  if (['，','。','12','层','个','堆叠','而成','构成','组成'].indexOf(tok) >= 0) return 3;         // 标点/数量
+  return 0;
+}
+
+/* ---------- 四种「问法」：教学用的四种代表性偏好 ----------
+   注意：真实模型里 12 个头各学各的分工，并不整齐对应这四类。
+   这里用 4 个手工 bias 造出「多头看的东西不一样」这个效果，是教学道具，不是观测结果。 */
+const HEAD_SPEC = [
+  { name:'局部头', desc:'只看紧邻的前一个词，负责语法接续', bias:(i,j)=> (i===j? 0.9 : (i-j===1? 1.5 : -0.35*(i-j))) },
+  { name:'句首头', desc:'把注意力压回序列开头，当作全局锚点',  bias:(i,j)=> (j===0? (i>2? 2.1 : 1.1) : -0.45) },
+  { name:'自身头', desc:'主要看自己，负责把本位置信息带下去',    bias:(i,j)=> (i===j? 2.0 : -0.55) },
+  { name:'语义头', desc:'连线给同一类词，负责跨距离语义关联',    bias:(i,j,toks)=> (groupOf(toks[i])===groupOf(toks[j]) && i!==j ? 1.5 : (i===j? 0.7 : -0.25)) }
+];
+
+/* ---------- 注意力：直接查真实 GPT-2 的权重 ----------
+   数据来源：本地 GPT-2 small（124M）用纯 numpy 跑的完整前向，
+   12 层 × 12 头 × 5×5（以及接一个词之后的 6×6）全部存进 REAL_ATTN。
+   这里只做查表 + 还原 mask/raw，没有随机数、没有手工偏置。 */
+const ATTN_CACHE = new Map();
+function realBundle(nTok){ return (nTok >= 6 ? REAL_ATTN.p6 : REAL_ATTN.p5); }
+function attention(layer, head, toks){
+  const n0 = (toks || S.tokens).length;
+  const key = layer + '|' + head + '|' + n0;
+  if (ATTN_CACHE.has(key)) return ATTN_CACHE.get(key);
+  const B = realBundle(n0);
+  const nB = B.tokens.length;
+  const n = Math.min(n0, nB);
+  const L = Math.max(0, Math.min(11, layer | 0));
+  const H = Math.max(0, Math.min(11, head | 0));
+  const src = B.attn[L][H];
+  const w = [], masked = [], raw = [];
+  for (let i = 0; i < n; i++){
+    w.push(src[i].slice(0, n));
+    masked.push(src[i].slice(0, n).map((v, j) => j > i));
+    raw.push(src[i].slice(0, n).map(v => (v > 0 ? Math.log(v) : -Infinity)));
+  }
+  const out = { w, masked, raw, real: true };
+  ATTN_CACHE.set(key, out);
+  return out;
+}
+
+/* 某个头在这一层实测出来的画像：首词 / 前词 / 自身 / 归一化熵 */
+function headProfile(layer, head){
+  const B = realBundle((S.tokens || []).length);
+  return B.prof[Math.max(0, Math.min(11, layer|0)) * 12 + Math.max(0, Math.min(11, head|0))];
+}
+
+/* 每个头「最关注谁」—— 右侧面板里那句话用 */
+function headPeak(info, toks){
+  const n = toks.length; let sum = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) sum[j] += info.w[i][j];
+  let k = 0; for (let j = 1; j < n; j++) if (sum[j] > sum[k]) k = j;
+  return { idx:k, tok:toks[k], share: sum.reduce((a,b)=>a+b,0) ? sum[k] / sum.reduce((a,b)=>a+b,0) : 0 };
+}
+
+/* ---------- 下一个词的概率分布 ---------- */
+function probDist(){
+  /* 真实 GPT-2 对当前这 5（或 6）个 token 的下一词分布；很扁，第一名也只有 18% */
+  const B = realBundle((S.tokens || []).length);
+  const list = B.next.map(pair => ({ w: pair[0].replace(/^ /, '') || '␣', p: pair[1] }));
+  const sum = list.reduce((a, x) => a + x.p, 0);
+  return { list, rest: Math.max(0, 1 - sum) };
+}
+
+
+/* =====================================================================
+   §3.1  阶段脚本：整条推理链路切成 12 步
+   ---------------------------------------------------------------------
+   每一步定义：标题、讲解、形状变化、哪个模块高亮（active）、以及相机看哪
+   ===================================================================== */
+const STAGES = [
+  { id:'tokens', name:'输入序列', badge:'STEP 01', title:'输入序列：先把句子切成 token',
+    active:'tokens', focus:'tokens', dur:3.4,
+    shapes:'[5]  token id 序列  文字:"GPT is a language"',
+    text:'先把这句英文切成 token（这里 5 个）。注意 GPT-2 用的是<b>字节级 BPE</b>：连 "GPT" 都被切成 G + PT 两片。' +
+         '它们现在是<b>一串整数 id</b>，还没有任何「含义」。' +
+         'GPT 的全部工作，就是把这串整数一层层算成「下一个词最可能是什么」。' +
+         '<br><br>注意画面上的每一条 token 都是一个<b>张量方块</b> —— 后面它会长成一条 768 维向量。' },
+
+  { id:'embed', name:'Token 嵌入 + 位置编码', badge:'STEP 02', title:'查表变成向量，再加上「位置」',
+    active:'embed', focus:'embed', dur:4.2,
+    shapes:'[5] 整数 → 查表 50257×768 → + 位置编码 → [5×768]',
+    text:'每个 id 去查一张 <b>50257×768</b> 的嵌入表，取出一行 768 维向量；' +
+         '再加上<b>位置编码</b>，让模型知道谁在前、谁在后（自注意力本身对顺序无感）。' +
+         '<br><br>于是得到一张 <b>5×768</b> 的矩阵。记住它的形状：' +
+         '整个 Decoder 堆叠<u>一路都保持这个形状</u>，变的只是里面的数值。' },
+
+  { id:'stack', name:'进入 Decoder 堆叠', badge:'STEP 03', title:'12 个 Decoder 块，首尾相接',
+    active:'b0', focus:'stack', dur:4.0,
+    shapes:'[5×768] → Decoder ×12（画 4 块）→ [5×768]',
+    text:'这一摞盒子才是 GPT 的真身：<b>12 个结构完全相同的 Decoder 块</b>，' +
+         '前一块的输出直接喂给后一块。画面上画 4 块，中间用「⋮ ×12」省略。' +
+         '<br><br>为什么只要 Decoder？因为 GPT 只做一件事：<b>预测下一个词</b>。' +
+         '输入和输出本来就是同一串文本，不需要 Encoder 去读另一个序列（点「架构总览」看对照）。' },
+
+  { id:'ln1', name:'① LayerNorm', badge:'STEP 04', title:'块内第一件事：LayerNorm',
+    active:'b0', sub:'ln1', focus:'b0', dur:3.6,
+    shapes:'[5×768] → LayerNorm → [5×768]',
+    text:'把块拉开看。第一件事是 <b>LayerNorm</b>：对<b>每个位置</b>的 768 个数分别减均值、除标准差，' +
+         '再乘 γ 加 β。它<b>不混合 token</b>，只把每个向量自己的数值拉回稳定范围。' +
+         '<br><br>为什么需要它？深网络里数值会越乘越大或越乘越小，归一化让 12 层叠起来仍然好训练。' },
+
+  { id:'mha', name:'② 掩码多头自注意力', badge:'STEP 05', title:'核心：掩码多头自注意力（真实权重）',
+    active:'b0', sub:'mha', focus:'b0', dur:9.0, mha:true,
+    shapes:'[5×768] → Q,K,V（12 头 × 64 维）→ 12×[5×64] → QKᵀ/√d_k + M → softmax → 12×[5×5] → ×V → 拼接 → W_O → [5×768]',
+    text:'这是唯一让 <b>token 之间交换信息</b> 的地方。每个位置算出 Query / Key / Value 三组向量，' +
+         '共 <b>12 个头</b>、每头 64 维（12×64 = 768，正好拼回残差流）。<br><br>' +
+         '<b>分数</b>：Q·Kᵀ/√d_k 得到一张 5×5 的「谁该看谁」表；' +
+         '<span class="warn">因果掩码 M 把右上角（未来）压成 −∞</span>，softmax 后变 0。<br><br>' +
+         '右侧那张表和 12 层 × 12 头的全部权重，是<b>真的跑了 GPT-2 small</b> 算出来的。' +
+         '顺手看见的真事：<b>三分之二的头都在往第一个 token 倒注意力</b>（attention sink），' +
+         '第 7 层整层平均 92.3%。所以「每个头各管一摊」只在第 0 层成立。' },
+  { id:'add1', name:'③ 残差 + LayerNorm', badge:'STEP 06', title:'残差连接：把原样也带过去',
+    active:'b0', sub:'add1', focus:'b0', dur:3.8,
+    shapes:'注意力输出 [5×768] + 块输入 [5×768] → LayerNorm → [5×768]',
+    text:'注意力的输出不会直接往下走，而是<b>先加上「进入注意力之前的那份张量」</b>：' +
+         '这就是<b>残差连接</b>（画面左侧那条绕过模块的旁路）。<br><br>' +
+         '它给了梯度一条直达的捷径：层数堆到几十上百层也还能训练（是缓解，不是保证不消失）；' +
+         '同时让每层只学「增量」，不用重学整个表示。加完再做一次 LayerNorm。' },
+
+  { id:'mlp', name:'④ MLP 前馈网络', badge:'STEP 07', title:'MLP：让每个 token 自己想清楚',
+    active:'b0', sub:'mlp', focus:'b0', dur:6.0, mlp:true,
+    shapes:'[5×768] → ×W₁ → [5×3072] → GELU → ×W₂ → [5×768]',
+    text:'注意力负责「横向」交流，MLP 负责「纵向」加工：它<b>逐位置</b>作用，token 之间互不相干。' +
+         '<br><br>先把 768 维撑到 <b>3072 维</b>（4 倍宽，给非线性留出组合空间），过 <b>GELU</b>，' +
+         '再压回 768。两个矩阵共约 <b>4.7 M</b> 参数 —— 一个 GPT-2 层里 2/3 的参数都在这里。' },
+
+  { id:'add2', name:'⑤ 残差 + 输出', badge:'STEP 08', title:'第二处残差：一块 Decoder 结束',
+    active:'b0', sub:'add2', focus:'b0', dur:3.6,
+    shapes:'MLP 输出 [5×768] + 上一处输出 → LayerNorm → [5×768] → 下一块',
+    text:'MLP 的输出同样加上残差、再过 LayerNorm，这一块的活儿就干完了。' +
+         '<br><br>一块 Decoder 的全部内容就是：<b>LN → 掩码多头注意力 → 残差+LN → MLP → 残差+LN</b>。' +
+         '12 块只是把这个盒子重复 12 次，形状永远是 5×768。' },
+
+  { id:'pass', name:'传递到第 2–12 层', badge:'STEP 09', title:'同样的盒子，重复 12 次',
+    active:'b1', focus:'stack', dur:5.0,
+    shapes:'[5×768] → 块 2 → 块 3 → ⋯ → 块 12 → [5×768]',
+    text:'后面 11 块结构和第 1 块<b>一模一样</b>，参数各不相同。数据一块块往上搬：' +
+         '每条 768 维向量被反复改写，逐渐从「词的表面」变成「能用来预测下一个词的状态」。' +
+         '<br><br>经验上：浅层偏语法/局部搭配，中层偏语义角色，深层才压向「该输出哪个词」。' },
+
+  { id:'final', name:'最终 LayerNorm', badge:'STEP 10', title:'最后一层 LayerNorm',
+    active:'finalLN', focus:'finalLN', dur:3.2,
+    shapes:'[5×768] → 最终 LayerNorm → [5×768]（只取最后一个位置）',
+    text:'12 块走完，做最后一次 LayerNorm，把数值收进稳定范围。' +
+         '<br><br>然后只取<b>最后一个位置</b>的 768 维向量 —— 因为它是唯一「看过整句」的位置，' +
+         '也只有它需要回答「下一个词是什么」。' },
+
+  { id:'logits', name:'Logits → Softmax', badge:'STEP 11', title:'从 768 维到 5 万个词的概率',
+    active:'logits', focus:'logits', dur:6.2, probs:true,
+    shapes:'[768] → ×词表矩阵 50257×768 → [50257] logits → softmax → 概率',
+    text:'把最后那个 768 维向量乘上<b>词表矩阵（50257×768）</b>，得到 50257 个分数（logits）；' +
+         'softmax 把它们变成概率，加起来等于 1。<br><br>' +
+         '右下角那排条是<b>真模型的分布</b>：第一名 " that" 只有 <b>18.0%</b>；榜上 10 个词加起来 47.2%，' +
+         '剩下 <b>52.8%</b> 摊在另外五万个词上。真实的语言模型是<b>扁的</b>，不像演示页上那种 42% 一锤定音。' },
+  { id:'loop', name:'自回归：接回去再来一遍', badge:'STEP 12', title:'自回归：把新词接回句尾，从头再跑',
+    active:'tokens', focus:'tokens', dur:7.0, probs:true, loop:true,
+    shapes:'"GPT is a language" + " that" → 6 个 token 重跑一遍 → 再预测下一个词',
+    text:'把刚生成的 " that" <b>接到序列末尾</b>，整句重新送进网络 —— 这就是<b>自回归</b>。' +
+         '<br><br>这不是动画：接上之后我们<b>真的又跑了一次前向</b>，注意力矩阵从 5×5 长成 <b>6×6</b>，' +
+         '新的一行一列都是实算的；此时模型给出的下一个词变成了 " is"（19.2%）。' +
+         '<br><br>每多一个 token 就要重算一次，这就是真实推理贵的原因（工程上用 KV Cache 省掉重复计算）。' }
+];

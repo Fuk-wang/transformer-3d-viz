@@ -1,0 +1,293 @@
+/* =====================================================================
+   §5  展廊视图（照第一版「门廊」的骨架重做）
+   ---------------------------------------------------------------------
+   结构（和 v1 一致，只是换成 GPT 的说法）：
+
+     z 轴 = 深度方向的一串「门」：① 嵌入 → ② 块1 → ③ 块2 → ④ 块3
+            → ⑤ 块4 → ⑥ 输出/logits。离观众最近的是嵌入门，越往里越深。
+     x 轴 = 词（每个词一根纵向的柱，珠子串在柱上）
+     y 轴 = 12 个注意力头：每块里每根柱分叉到 12 条头轨再收回来（亮的是当前选中的头）
+     珠子   = 某个词在某道门上的 768 维向量
+     弧带   = 这一块里「谁在看谁」，粗细/亮度 = 权重
+   门内那层暖光（玻璃面）就是 v1 的「展柜」感 —— 只在柜内发光，
+   柜外仍是深空星野，所以不会整屏糊成米黄。
+   ===================================================================== */
+
+/* ★ 展廊的尺寸：想调疏密就改这里 */
+const STG = {
+  gapX:    2.02,   // 词间距
+  gateGap: 3.95,   // 门与门的纵深距离
+  halfH:   2.90,   // 门框半高
+  rad:     1.15,   // 门框圆角
+  r0:      0.42,   // 珠子基础半径
+  floorY: -2.62    // 地面高度
+};
+const N_GATE = 6;
+/* 12 步 → 站到第几道门（0 嵌入 · 1..4 块 · 5 输出） */
+const GATE_OF_STAGE = [0, 0, 1, 1, 1, 1, 2, 2, 3, 4, 5, 5];
+const GATE_LABEL = ['① 嵌入', '② 块 1', '③ 块 2', '④ 块 3', '⑤ 块 4', '⑥ 输出'];
+const GATE_SUB   = ['EMBEDDING', '注意力 + MLP', '注意力 + MLP', '注意力 + MLP', '注意力 + MLP', 'LOGITS → SOFTMAX'];
+/* 12 条头轨的竖直位置：均布在门内，和 v1 的「头轨」一样分叉 */
+const HYN = Array.from({length: 12}, function(_, h){ return 1.92 - h * (3.84 / 11); });   // 12 条真头轨
+
+const SC = {
+  gold:     C('#d9b56a', 1.0),
+  goldSoft: C('#d9b56a', 0.42),
+  goldFaint:C('#d9b56a', 0.15),
+  lapis:    C('#16224a', 0.96),
+  lapisLt:  C('#5b86d6', 1.0),
+  lapisSoft:C('#5b86d6', 0.32),
+  mal:      C('#2f9e86', 1.0),
+  cin:      C('#c8402f', 1.0),
+  cinSoft:  C('#c8402f', 0.42)
+};
+/* 12 条头轨的颜色：沿用 v1 的四色，循环取，避免 h>=4 时拿到 undefined */
+const HEAD_BASE = [C('#5b86d6', 0.9), C('#d9b56a', 0.9), C('#67d3b6', 0.9), C('#e7765c', 0.9)];
+const HEAD_COL = Array.from({ length: 12 }, function(_, h){ return HEAD_BASE[h % 4]; });
+const TOK_COL = { 0: '#d9b56a', 1: '#d9b56a', 2: '#5b86d6', 3: '#2f9e86' };
+
+/* 门在 z 轴上的位置：嵌入在 0（最近），越深越负 */
+function stZ(g){ return -g * STG.gateGap; }
+function stX(i){ const n = S.tokens.length; return (i - (n - 1) / 2) * STG.gapX; }
+function stHalfW(){ return Math.max(3.2, (S.tokens.length - 1) / 2 * STG.gapX + 1.38); }
+function stGateNow(){ return GATE_OF_STAGE[S.stage] || 0; }
+function anatTop(){ return stGateNow(); }
+/* 每颗珠子的大小：同一个词固定，越往里略小（远处的层更「抽象」） */
+function stR(i, g){
+  const h = mulberry32(seedOf(i, 7, (S.tokens[i] || '').length, 13))();
+  return (STG.r0 + 0.075 * h) * (1 - 0.030 * g);
+}
+/* 远处的整体压暗，冒充一点空气透视 */
+function stDepth(g){ return 1 - 0.075 * g; }
+
+/* 相机：沿着长廊看进去；词越多退越远 */
+function anatCameraTarget(stageIdx){
+  const zMid = (stZ(0) + stZ(N_GATE - 1)) / 2;
+  return { p: [1.5, 0.02, zMid], d: 25.6 + Math.max(0, S.tokens.length - 5) * 0.6 };
+}
+
+/* 圆角门框的路径（x-y 平面上的一个圆角矩形） */
+function gatePath(hw, hh, r, z, n){
+  n = n || 7;
+  const out = [];
+  const cs = [[hw - r, hh - r, 0], [-hw + r, hh - r, Math.PI / 2],
+              [-hw + r, -hh + r, Math.PI], [hw - r, -hh + r, Math.PI * 1.5]];
+  for (const c of cs){
+    for (let k = 0; k <= n; k++){
+      const a = c[2] + k / n * Math.PI / 2;
+      out.push([c[0] + Math.cos(a) * r, c[1] + Math.sin(a) * r, z]);
+    }
+  }
+  out.push(out[0].slice());
+  return out;
+}
+
+/* 一颗珠子：本体 + 柔光壳 + 选中时的金环 */
+function gateBead(g, i, hl, dim){
+  const x = stX(i), z = stZ(g), r = stR(i, g);
+  const isGen = i >= PROMPT_TOKENS.length;
+  const base = isGen ? SC.mal : C(TOK_COL[groupOf(S.tokens[i] || '')] || '#d9b56a', 1.0);
+  const col = mixC(base, SC.gold, hl * 0.42);
+  const a = clamp01(dim);
+  if (a <= 0.02) return;
+  sphere(BUF_OPAQUE, x, 0, z, r, [col[0], col[1], col[2], 0.98 * a], 0.10 + 0.55 * hl, 12, 7);
+  if (a > 0.35) sphere(BUF_GLASS, x, 0, z, r * 1.24, [base[0], base[1], base[2], (0.05 + 0.13 * hl) * a], 0.55, 9, 5);
+  if (hl > 0.30) ring3d(BUF_GLASS, x, 0, z, r * 1.30, 0.011, [SC.gold[0], SC.gold[1], SC.gold[2], (0.12 + 0.45 * hl) * a], 0.7, 22);
+}
+
+/* 星野：柜子外面那层细碎的光点（固定种子，不会闪） */
+function stageStars(){
+  const rnd = mulberry32(0x5EED17);
+  for (let k = 0; k < 150; k++){
+    const x = (rnd() - 0.5) * 52;
+    const y = (rnd() - 0.5) * 26 + 1.5;
+    const z = 8 - rnd() * 46;
+    const warm = rnd() > 0.68;
+    const c = warm ? C('#d9b56a', 0.55) : C('#a8c4f0', 0.45);
+    const s = 0.035 + rnd() * 0.045;
+    box(BUF_GLASS, x, y, z, s, s, s, c, 1);
+  }
+}
+
+/* 一块 Decoder 里：每根柱子分叉到 12 条头轨，再收回（12 头真数据） */
+function blockFan(g, dim, active){
+  const n = S.tokens.length;
+  const zIn = stZ(g - 1), zOut = stZ(g), zMid = (zIn + zOut) / 2;
+  for (let i = 0; i < n; i++){
+    const x = stX(i);
+    for (let h = 0; h < NHEAD_DRAW; h++){
+      const on = active && S.head === h;
+      const c0 = on ? HEAD_COL[h] : SC.goldSoft;
+      const a = (on ? 0.62 : 0.17) * dim;
+      const col = [c0[0], c0[1], c0[2], a];
+      const w = on ? 0.030 : 0.020;
+      ribbon(BUF_OPAQUE, [[x, 0, zIn], [x, HYN[h], zMid]], w, col, on ? 0.9 : 0.15);
+      ribbon(BUF_OPAQUE, [[x, HYN[h], zMid], [x, 0, zOut]], w, col, on ? 0.9 : 0.15);
+      /* 头轨上的小结节 */
+      box(BUF_OPAQUE, x, HYN[h], zMid, 0.055, 0.055, 0.055,
+          [c0[0], c0[1], c0[2], (on ? 0.75 : 0.22) * dim], on ? 0.8 : 0);
+    }
+  }
+}
+
+/* 一块 Decoder 的注意力弧（画在这块出口那道门上，珠子就在那里） */
+function stageArcs(g, dim, reveal){
+  const n = S.tokens.length;
+  const info = attention((typeof S.layer === 'number' ? S.layer : g - 1), S.head, S.tokens);
+  const z = stZ(g) + 0.10;
+  for (let i = 0; i < n; i++){
+    for (let j = 0; j < i; j++){
+      const w = info.w[i][j];
+      if (!w || w < 0.03) continue;
+      const isQ = (S.qIdx < 0) || (i === S.qIdx);
+      const vis = clamp01(reveal * (n + 0.5) - i) * (isQ ? 1 : 0.12) * dim;
+      if (vis <= 0.02) continue;
+      const t = clamp01(Math.pow(w, 0.62) * 1.35);
+      const c0 = t < 0.62 ? mixC(SC.lapisSoft, SC.goldSoft, t / 0.62)
+                          : mixC(SC.gold, SC.cinSoft, (t - 0.62) / 0.38);
+      const col = [c0[0], c0[1], c0[2], c0[3] * vis];
+      const wd = 0.030 + 0.082 * Math.pow(w, 0.65);
+      arcBetween(BUF_OPAQUE, [stX(i), stR(i, g) * 0.75, z], [stX(j), stR(j, g) * 0.75, z],
+                 0.42 + 0.62 * w, wd, col, 0.80, 14);
+    }
+  }
+}
+
+/* 最后一道门上的概率柱 */
+function stageLogits(dim){
+  if (dim <= 0.02) return;
+  const n = S.tokens.length, z = stZ(N_GATE - 1);
+  const x0 = stX(n - 1);
+  const dist = probDist(S.gen), top = dist.list[0].p;
+  const bars = Math.min(6, dist.list.length);
+  for (let k = 0; k < bars; k++){
+    const p = dist.list[k].p;
+    const hh = 0.20 + 1.15 * (p / Math.max(0.01, top)) * dim;
+    box(BUF_OPAQUE, x0 + (k - (bars - 1) / 2) * 0.40, 0.60 + hh / 2, z + 0.35, 0.22, hh, 0.22,
+        k === 0 ? SC.gold : SC.lapisSoft, k === 0 ? 0.5 * dim : 0.08);
+  }
+}
+
+/* 主绘制：S.mode === 'anatomy' 时由 drawScene() 分派进来 */
+function drawAnatomy(pulse, st, prog){
+  const n = S.tokens.length;
+  const now = stGateNow();
+  const hw = stHalfW(), hh = STG.halfH;
+
+  /* ---- 外场：星野 + 地面藻井 + 涟漪 ---- */
+  stageStars();
+  dunhuangFloor(BUF_GLASS, STG.floorY, hw + 3.6, C('#d9b56a', 0.22), C('#d9b56a', 0.11), 1);
+  for (let k = 0; k < 3; k++){
+    const rr = 7.6 + k * 3.1, cz = stZ(N_GATE - 1) / 2, pts = [];
+    for (let m = 0; m <= 64; m++){
+      const a = m / 64 * Math.PI * 2;
+      pts.push([Math.cos(a) * rr, STG.floorY + 0.012, cz + Math.sin(a) * rr]);
+    }
+    ribbon(BUF_GLASS, pts, 0.012, C('#d9b56a', 0.13 - k * 0.03), 0);
+  }
+
+  /* ---- 一道道门 ---- */
+  for (let g = 0; g < N_GATE; g++){
+    const z = stZ(g);
+    const reached = g <= now, active = (g === now);
+    const dg = stDepth(g);
+    /* 门内的暖雾（展柜的灯）：只有柜内是暖的 */
+    const haze = (active ? 0.090 : (reached ? 0.050 : 0.020)) * dg;
+    quad(BUF_GLASS, [-hw, -hh, z], [hw, -hh, z], [hw, hh, z], [-hw, hh, z], C('#d9b56a', haze), 1);
+    /* 门框 */
+    ribbon(BUF_OPAQUE, gatePath(hw, hh, STG.rad, z, 7), active ? 0.052 : 0.030,
+           C('#d9b56a', (active ? 1.0 : (reached ? 0.56 : 0.24)) * dg), 1);
+    /* 门顶的灯带：v1 那种柜内暖光的光源感 */
+    beam(BUF_GLASS, -hw + 0.3, hh - 0.14, z, hw - 0.3, hh - 0.14, z, active ? 0.055 : 0.035,
+         C('#f4e2b4', (active ? 0.5 : 0.26) * dg), 1);
+    /* 门底的横档（像门槛） */
+    beam(BUF_OPAQUE, -hw, -hh, z, hw, -hh, z, active ? 0.030 : 0.018,
+         C('#d9b56a', (active ? 0.55 : 0.22) * dg), active ? 0.6 : 0);
+  }
+
+  /* ---- 纵向的柱 + 门与门之间的轨道 ---- */
+  for (let i = 0; i < n; i++){
+    const x = stX(i);
+    for (let g = 1; g < N_GATE; g++){
+      const reached = g <= now;
+      beam(BUF_OPAQUE, x, 0, stZ(g - 1), x, 0, stZ(g), 0.020,
+           [SC.goldSoft[0], SC.goldSoft[1], SC.goldSoft[2], (reached ? 0.34 : 0.13) * stDepth(g)], reached ? 0.35 : 0);
+    }
+  }
+
+  /* ---- 四块 Decoder：分叉 + 弧 ---- */
+  for (let g = 1; g <= 4; g++){
+    const reached = g <= now, active = (g === now);
+    const dim = (active ? 1 : (reached ? 0.55 : 0.10)) * stDepth(g);
+    blockFan(g, dim, active);
+    const reveal = active ? clamp01(0.70 + S.t / Math.max(0.7, st.dur * 0.7)) : 1;
+    /* 只画当前这一块的弧：四块同时画会糊成一团 */
+    if (g === now) stageArcs(g, dim, reveal);
+  }
+
+  /* ---- 每道门上的珠子 ---- */
+  for (let g = 0; g < N_GATE; g++){
+    const reached = g <= now, active = (g === now);
+    const dim = (active ? 1 : (reached ? 0.62 : 0.12)) * stDepth(g);
+    for (let i = 0; i < n; i++){
+      const q = (S.qIdx < 0) ? (i === n - 1) : (i === S.qIdx);
+      const hl = active ? (0.32 + 0.42 * pulse) * (q ? 1 : 0.55) : (reached ? 0.05 : 0);
+      gateBead(g, i, hl, dim);
+    }
+  }
+
+  /* ---- 输出门的概率柱 ---- */
+  if (now >= 5 && (st.id === 'final' || st.id === 'logits' || st.loop || st.id === 'pass')){
+    stageLogits(st.id === 'logits' ? clamp01(0.2 + S.t / Math.max(0.5, st.dur * 0.5)) : 1);
+  }
+
+  /* ---- 展示柜的外框：最靠前那圈粗金框，把整个场景「框」起来 ---- */
+  ribbon(BUF_OPAQUE, gatePath(hw + 0.42, hh + 0.42, STG.rad + 0.3, stZ(0) + 0.62, 8), 0.085,
+         C('#d9b56a', 0.40), 1);
+  
+
+  /* ---- 自回归：新词从输出门飞回嵌入门 ---- */
+  if (st.loop){
+    const k = clamp01((S.t - 1.0) / 1.7), e = ease(k);
+    if (k > 0.01){
+      const from = [stX(n - 1), 0, stZ(0)];
+      const to   = [stX(n - 1) + STG.gapX, 0, stZ(0)];
+      const gx = lerp(from[0], to[0], e);
+      sphere(BUF_GLASS, gx, 0, stZ(0) + 0.35, 0.30, [SC.mal[0], SC.mal[1], SC.mal[2], 0.55], 0.9, 11, 6);
+      ring3d(BUF_OPAQUE, gx, 0, stZ(0) + 0.35, 0.40, 0.012, [SC.mal[0], SC.mal[1], SC.mal[2], 0.9], 1, 22);
+    }
+  }
+}
+
+/* ---------------- 展廊的文字层 ---------------- */
+function addAnatLabels(){
+  /* 词名：贴在最近那道门（嵌入门）里的柱子下方 */
+  for (let i = 0; i < MAX_TOKENS; i++){
+    addLabel('lbl-sphere', '', () => {
+      if (S.mode !== 'anatomy' || i >= S.tokens.length) return null;
+      return [stX(i), -1.30, stZ(0) + 0.2];
+    }, 'center', i, 'anatomy');
+  }
+  /* 门的编号与名字：挂在每道门的左上角 */
+  for (let g = 0; g < N_GATE; g++){
+    addLabel('lbl-gate', GATE_LABEL[g], () => {
+      if (S.mode !== 'anatomy') return null;
+      if (Math.abs(g - stGateNow()) > 1) return null;
+      return [-stHalfW() - 0.30, STG.halfH + 0.30, stZ(g)];
+    }, 'right', null, 'anatomy');
+  }
+  /* 只给选中的那条头轨挂一个名字，12 条都挂会糊 */
+  addLabel('lbl-head', '', () => {
+    if (S.mode !== 'anatomy' || !STAGES[S.stage].mha) return null;
+    const g = Math.max(1, Math.min(4, stGateNow()));
+    return [stHalfW() - 0.12, HYN[S.head], (stZ(g - 1) + stZ(g)) / 2];
+  }, 'right', null, 'anatomy');
+  addLabel('lbl-note', '残差流 → 一门一门往里走', () => {
+    if (S.mode !== 'anatomy' || stGateNow() < 1) return null;
+    return [-stHalfW() + 0.10, STG.floorY + 0.42, stZ(0) + 0.4];
+  }, 'left', null, 'anatomy');
+  addLabel('lbl-tiny', '弧 = 这一块的注意力 · 越粗越亮权重越大', () => {
+    if (S.mode !== 'anatomy') return null;
+    return [0, STG.halfH + 1.35, stZ(0)];
+  }, 'center', null, 'anatomy');
+}

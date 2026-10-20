@@ -1,0 +1,135 @@
+/* =====================================================================
+   §4.2  解剖视图用的几何：球体 / 弧形光带 / 藻井地纹
+   ---------------------------------------------------------------------
+   仍然是「每帧重拼顶点」的老办法：
+     · sphere()      经纬球，给词球用
+     · ring3d()      一圈细线，给球的轮廓光环（非实心，省顶点）
+     · arcRibbon()   二次贝塞尔 + 面向相机的扁带 → 看起来是光滑的发光弧
+     · dunhuangFloor()  藻井地纹：几层套方 + 角上的短刻度
+   ===================================================================== */
+
+/* 相机的眼睛位置：每帧由 updateCamera() 写进来，弧线要朝向它才好看 */
+const EYE = [0, 0, 8];
+
+/* 经纬球：直接写进顶点缓冲，法线 = 单位球面法线 */
+function sphere(b, cx, cy, cz, r, c, glow, seg, ring){
+  seg = seg || 12; ring = ring || 7;
+  for (let i = 0; i < ring; i++){
+    const v0 = i / ring * Math.PI, v1 = (i + 1) / ring * Math.PI;
+    const y0 = Math.cos(v0), y1 = Math.cos(v1);
+    const r0 = Math.sin(v0), r1 = Math.sin(v1);
+    for (let j = 0; j < seg; j++){
+      const u0 = j / seg * Math.PI * 2, u1 = (j + 1) / seg * Math.PI * 2;
+      const p00 = [cx + r*r0*Math.cos(u0), cy + r*y0, cz + r*r0*Math.sin(u0)];
+      const p10 = [cx + r*r0*Math.cos(u1), cy + r*y0, cz + r*r0*Math.sin(u1)];
+      const p01 = [cx + r*r1*Math.cos(u0), cy + r*y1, cz + r*r1*Math.sin(u0)];
+      const p11 = [cx + r*r1*Math.cos(u1), cy + r*y1, cz + r*r1*Math.sin(u1)];
+      const n = p => { const d = [p[0]-cx, p[1]-cy, p[2]-cz]; const L = Math.hypot(d[0],d[1],d[2]) || 1; return [d[0]/L, d[1]/L, d[2]/L]; };
+      const nn = n(p00), nn2 = n(p11);
+      /* 两个三角形，法线用球面法线（顶点级插值，边缘不会发黑） */
+      vtx(b, p00[0],p00[1],p00[2], nn[0],nn[1],nn[2], c, glow);
+      vtx(b, p10[0],p10[1],p10[2], n(p10)[0],n(p10)[1],n(p10)[2], c, glow);
+      vtx(b, p01[0],p01[1],p01[2], n(p01)[0],n(p01)[1],n(p01)[2], c, glow);
+      vtx(b, p10[0],p10[1],p10[2], n(p10)[0],n(p10)[1],n(p10)[2], c, glow);
+      vtx(b, p11[0],p11[1],p11[2], nn2[0],nn2[1],nn2[2], c, glow);
+      vtx(b, p01[0],p01[1],p01[2], n(p01)[0],n(p01)[1],n(p01)[2], c, glow);
+    }
+  }
+}
+
+/* 水平圆环（球外的一圈细辉光）：用细梁拼，成本低 */
+function ring3d(b, cx, cy, cz, r, t, c, glow, seg){
+  seg = seg || 28;
+  for (let k = 0; k < seg; k++){
+    const a0 = k / seg * Math.PI * 2, a1 = (k + 1) / seg * Math.PI * 2;
+    const x0 = cx + r*Math.cos(a0), z0 = cz + r*Math.sin(a0);
+    const x1 = cx + r*Math.cos(a1), z1 = cz + r*Math.sin(a1);
+    beam(b, x0, cy, z0, x1, cy, z1, t, c, glow);
+  }
+}
+
+/* 二次贝塞尔取样 */
+function bez(p0, pc, p1, n){
+  const out = [];
+  for (let k = 0; k <= n; k++){
+    const t = k / n, it = 1 - t;
+    out.push([
+      it*it*p0[0] + 2*it*t*pc[0] + t*t*p1[0],
+      it*it*p0[1] + 2*it*t*pc[1] + t*t*p1[1],
+      it*it*p0[2] + 2*it*t*pc[2] + t*t*p1[2]
+    ]);
+  }
+  return out;
+}
+
+/* 面向相机的扁带：把一串点变成一条有宽度的光弧（法线朝相机 → 不受光照影响）
+   width 会沿弧线两端收窄，看起来像一笔毛笔线。 */
+function ribbon(b, pts, width, c, glow){
+  if (pts.length < 2 || width <= 0.0006) return;
+  for (let k = 0; k + 1 < pts.length; k++){
+    const p0 = pts[k], p1 = pts[k+1];
+    let tx = p1[0]-p0[0], ty = p1[1]-p0[1], tz = p1[2]-p0[2];
+    const tl = Math.hypot(tx,ty,tz) || 1; tx/=tl; ty/=tl; tz/=tl;
+    const mx = (p0[0]+p1[0])/2, my = (p0[1]+p1[1])/2, mz = (p0[2]+p1[2])/2;
+    let vx = mx-EYE[0], vy = my-EYE[1], vz = mz-EYE[2];
+    const vl = Math.hypot(vx,vy,vz) || 1; vx/=vl; vy/=vl; vz/=vl;
+    /* side = t × v（朝相机方向的垂线） */
+    let sx = ty*vz - tz*vy, sy = tz*vx - tx*vz, sz = tx*vy - ty*vx;
+    const sl = Math.hypot(sx,sy,sz) || 1; sx/=sl; sy/=sl; sz/=sl;
+    /* 两端收窄：第 k 段占全弧的位置 */
+    const u = (k + 0.5) / (pts.length - 1);
+    const taper = 0.48 + 0.52 * Math.pow(Math.sin(Math.PI * Math.min(1, Math.max(0, u))), 0.40);
+    const w = width * taper;
+    const a = [p0[0]+sx*w, p0[1]+sy*w, p0[2]+sz*w];
+    const bq= [p1[0]+sx*w, p1[1]+sy*w, p1[2]+sz*w];
+    const cq= [p1[0]-sx*w, p1[1]-sy*w, p1[2]-sz*w];
+    const d = [p0[0]-sx*w, p0[1]-sy*w, p0[2]-sz*w];
+    /* 法线朝相机，让着色器里的边缘光几乎不起作用 → 颜色稳定 */
+    const nn = [vx, vy, vz];
+    const put = p => vtx(b, p[0],p[1],p[2], nn[0],nn[1],nn[2], c, glow);
+    put(a); put(bq); put(cq);
+    put(a); put(cq); put(d);
+  }
+}
+
+/* 一条带拱高的注意力弧：从 a 到 b，控制点在中点上方 lift 处 */
+function arcBetween(b, a, bb, lift, width, c, glow, segs){
+  const mid = [(a[0]+bb[0])/2, (a[1]+bb[1])/2 + lift, (a[2]+bb[2])/2];
+  ribbon(b, bez(a, mid, bb, segs || 16), width, c, glow);
+}
+
+/* 竖直细线（残差流）：从 y0 到 y1，带一点渐隐（顶端用更淡的颜色） */
+function residualFlow(b, x, z, y0, y1, t, c, glow){
+  beam(b, x, y0, z, x, y1, z, t, c, glow);
+  /* 沿线的三个小节点，表示「每层都往上加一笔」 */
+  const n = 3;
+  for (let k = 0; k < n; k++){
+    const y = y0 + (y1 - y0) * (k + 0.5) / n;
+    box(b, x, y, z, t*2.6, 0.09, t*2.6, c, glow);
+  }
+}
+
+/* 藻井地纹：几层套方 + 四角短刻度 + 中轴十字，全部贴在地面上 */
+function dunhuangFloor(b, y, half, cMain, cTick, a){
+  const step = half / 4;
+  for (let k = 1; k <= 4; k++){
+    const s = step * k;
+    const w = (k === 4 ? 0.022 : 0.014);
+    const cc = k === 4 ? cMain : cTick;
+    beam(b, -s, y, -s,  s, y, -s, w, cc, 0);
+    beam(b, -s, y,  s,  s, y,  s, w, cc, 0);
+    beam(b, -s, y, -s, -s, y,  s, w, cc, 0);
+    beam(b,  s, y, -s,  s, y,  s, w, cc, 0);
+  }
+  /* 角上的短刻度（像画框的角花） */
+  for (let k = 0; k < 4; k++){
+    const sx = k < 2 ? -1 : 1, sz = (k % 2 === 0) ? -1 : 1;
+    for (let m = 1; m <= 3; m++){
+      const d = step * (3.05 + m * 0.22);
+      beam(b, sx*d, y, sz*half*0.42, sx*d, y, sz*(half*0.42 + 0.42), 0.012, cTick, 0);
+    }
+  }
+  /* 中轴十字 */
+  beam(b, -half, y, 0, half, y, 0, 0.012, cTick, 0);
+  beam(b, 0, y, -half, 0, y, half, 0.012, cTick, 0);
+}

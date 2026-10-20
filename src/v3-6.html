@@ -1,0 +1,969 @@
+/* =====================================================================
+   §5  场景、状态机与交互
+   ---------------------------------------------------------------------
+   布局是「动态算出来的」：块 1 在演内部时会像抽屉一样拉开，其他块压缩，
+   所以每一帧都重新算一版 LAY（各模块的 y 坐标），再据此拼几何。
+   ===================================================================== */
+
+let W = 1, H = 1, DPR = 1, VIEW_DIST = 20;   // VIEW_DIST = 当前有效相机距离（2D 时会被拉大）
+
+const S = {
+  stage: 0,          // 当前阶段（0..11）
+  t: 0,              // 本阶段内已过秒数
+  playing: false,
+  speed: 1,
+  follow: true,
+  head: 0,           // 右侧选中的注意力头（0..11）
+  layer: 0,          // 右侧选中的层（0..11）
+  gen: 0,            // 已经生成几个 token
+  tokens: PROMPT_TOKENS.slice(),
+  view2d: false,     // 是否 2D 视图（实际渲染用 viewT 做平滑过渡）
+  expandW: 0,        // 块 1 拉开进度 0..1
+  mhaE: 0,           // 注意力矩阵展开进度
+  mlpE: 0,           // MLP 展开进度
+  viewT: 0,          // 0=3D 1=2D
+  cubeFrom: [0,0,0],
+  pulse: 0,
+  mode: 'box',       // 'box' = 结构框图；'anatomy' = 向量解剖（两套视图共用同一套状态机）
+  qIdx: -1           // 解剖视图里的「查询位置」；-1 = 看全部行
+};
+
+/* 相机：az/el/zoom 由鼠标控制，tgt 由「跟随」自动对准当前模块 */
+const CAM = { az: 0.58, el: 0.26, zoom: 1, tgt: [0, 5.4, 0], dist: 20, fov: 42 };
+
+const LAY = { blocks: [], sub: {}, n: 5 };
+const COL = {
+  body:      C('#26334f', 0.96),
+  bodyEdge:  C('#6f92cc', 0.9),
+  subBody:   C('#2b3a5c', 0.97),
+  addBody:   C('#31405f', 0.97),
+  lnBody:    C('#2a3854', 0.97),
+  amber:     C('#d9b56a', 0.95),
+  amberSoft: C('#d9b56a', 0.35),
+  cyan:      C('#5b86d6', 0.95),
+  cyanSoft:  C('#5b86d6', 0.28),
+  green:     C('#2f9e86', 0.95),
+  rose:      C('#c8402f', 0.55),
+  ink:       C('#efe4cb', 0.9),
+  faint:     C('#6f7fa6', 0.55),
+  deep:      C('#141a2e', 0.92)
+};
+const BLOCK_W = 7.2, BLOCK_D = 2.6;
+
+/* ---------------- 布局 ---------------- */
+function computeLayout(){
+  const n = S.tokens.length;
+  LAY.n = n;
+  LAY.gap = 1.06; LAY.cube = 0.6;
+  LAY.tokY = 0.15;
+  LAY.tokX = i => (i - (n-1)/2) * LAY.gap;
+  LAY.embedY = 1.42;
+  LAY.embedW = Math.min(8.6, n*LAY.gap + 1.2);
+
+  const p = 0.30, hLN = 0.44, hADD = 0.44, g = 0.40;
+  const hMHA = 0.62 + 2.30 * S.mhaE;
+  const hMLP = 0.62 + 0.85 * S.mlpE;
+  const openH = 2*p + hLN + g + hMHA + g + hADD + g + hMLP + g + hADD;
+  const compactH = 1.04;
+
+  LAY.blocks = [];
+  let y = LAY.embedY + 0.21 + 0.66;
+  for (let i = 0; i < NBLOCK; i++){
+    const open = (i === 0) ? S.expandW : 0;
+    const h = lerp(compactH, openH, open);
+    LAY.blocks.push({ i, y0:y, y1:y+h, h, open, cx:0, cz:0 });
+    y += h + 0.34;
+  }
+  LAY.stackTop = y - 0.34;
+  LAY.dotsY = LAY.stackTop + 0.66;
+  LAY.finalY = LAY.dotsY + 0.96;
+  LAY.logitsY = LAY.finalY + 1.62;
+  LAY.openH = openH;
+
+  /* 块 1 内部的五个子模块（自下而上） */
+  let yy = LAY.blocks[0].y0 + p;
+  LAY.sub = {};
+  const add = (key, h) => { LAY.sub[key] = { y0:yy, y1:yy+h, cy:yy+h/2, h }; yy += h + g; };
+  add('ln1', hLN); add('mha', hMHA); add('add1', hADD); add('mlp', hMLP); add('add2', hADD);
+}
+
+/* 每个阶段「张量应该待在哪」 */
+function anchorOf(stageIdx, prog){
+  const b = LAY.blocks, n = LAY.n;
+  switch (stageIdx){
+    case 0:  return [LAY.tokX(n-1), LAY.tokY + 0.62, 1.0];
+    case 1:  return [0, LAY.embedY, 1.05];
+    case 2:  return [0, b[0].y0 + 0.34, 0.95];
+    case 3:  return [0, LAY.sub.ln1.cy, 1.6];
+    case 4:  return [0, LAY.sub.mha.cy, 1.65];
+    case 5:  return [0, LAY.sub.add1.cy, 1.6];
+    case 6:  return [0, LAY.sub.mlp.cy, 1.6];
+    case 7:  return [0, LAY.sub.add2.cy, 1.6];
+    case 8:  {                                     // 快速穿过第 2–4 块
+      const k = 1 + Math.min(NBLOCK-2, Math.floor(clamp01((prog-0.05)/0.66) * (NBLOCK-1)));
+      return [0, b[k].y0 + b[k].h/2, 0.95];
+    }
+    case 9:  return [0, LAY.finalY, 1.15];
+    case 10: return [0, LAY.logitsY, 1.35];
+    default: return [LAY.tokX(n-1), LAY.tokY + 0.62, 1.0];
+  }
+}
+/* 每个阶段相机该看哪（框图视图） */
+function cameraTargetOfBox(stageIdx){
+  const st = STAGES[stageIdx], b = LAY.blocks;
+  if (st.id === 'tokens') return { p:[0, 0.9, 0], d:12.5 };
+  if (st.id === 'embed')  return { p:[0, LAY.embedY + 0.3, 0], d:11.5 };
+  if (st.id === 'stack' || st.id === 'pass') return { p:[0, (b[0].y0 + LAY.logitsY + 1.6)/2, 0], d:Math.max(27, 3.6*LAY.stackTop/2.2) };
+  if (st.sub){
+    /* 窗口越矮，相机退得越远，保证模块框 + token 行 + 控制条都不打架 */
+    const d = 19.6 + Math.max(0, (900 - H) / 200) * 1.6;
+    return { p:[0, (LAY.sub.ln1.y0 + LAY.sub.add2.y1)/2 - 0.35, 0], d:d };
+  }
+  if (st.id === 'final') return { p:[0, LAY.finalY, 0], d:12.5 };
+  if (st.id === 'logits') return { p:[0, LAY.logitsY - 0.3, 0], d:14.5 };
+  if (st.id === 'loop')   return { p:[0, LAY.stackTop*0.55, 0], d:27 };
+  return { p:[0, 2.2, 0], d:14 };
+}
+
+/* 相机目标按当前视图分派（解剖视图的取景在 §3.2 / §5 里） */
+function cameraTargetOf(stageIdx){
+  return (S.mode === 'anatomy') ? anatCameraTarget(stageIdx) : cameraTargetOfBox(stageIdx);
+}
+
+/* ---------------- 文字层（3D 投影） ---------------- */
+const labelsEl = document.getElementById('labels');
+const LBL = [];
+function addLabel(cls, text, getPos, align, tokIdx, mode){
+  const el = document.createElement('div');
+  el.className = 'lbl ' + cls;
+  el.textContent = text;
+  labelsEl.appendChild(el);
+  const o = { el, getPos, align: align || 'center', tokIdx: (tokIdx === undefined ? null : tokIdx),
+              mode: mode || 'box', lastText: text };
+  LBL.push(o);
+  return o;
+}
+function updateLabels(){
+  for (let i = 0; i < LBL.length; i++){
+    const o = LBL[i];
+    /* 不属于当前视图的标签直接收起来（两套视图的标签共用这一个池子） */
+    if (o.mode !== S.mode){
+      o.el.style.opacity = '0';
+      o.el.style.transform = 'translate(-9999px,-9999px)';
+      continue;
+    }
+    /* token 标签的文字随生成过程变化 */
+    if (o.tokIdx !== null){
+      const t = S.tokens[o.tokIdx] || '';
+      if (t !== o.lastText){
+        o.lastText = t;
+        o.el.textContent = t;
+        o.el.classList.toggle('gen', o.tokIdx >= PROMPT_TOKENS.length);
+      }
+      /* 解剖视图里，被选中的「查询位置」把球名点亮 */
+      if (o.el.classList.contains('lbl-sphere')) o.el.classList.toggle('q', o.tokIdx === S.qIdx);
+    }
+    let pos = null;
+    try { pos = o.getPos(); } catch (e) { pos = null; }
+    const hide = () => {
+      o.el.style.opacity = '0';
+      o.el.style.transform = 'translate(-9999px,-9999px)';   // 移出画面，避免没定位过的标签堆在左上角
+    };
+    if (!pos){ hide(); continue; }
+    const s = project(pos);
+    if (!s || !isFinite(s.x) || !isFinite(s.y)){ hide(); continue; }
+    if (s.x < -160 || s.x > W + 160 || s.y < -90 || s.y > H + 90){ hide(); continue; }
+    const ax = o.align === 'right' ? ' translate(-100%,-50%)' : o.align === 'left' ? ' translate(0,-50%)' : ' translate(-50%,-50%)';
+    o.el.style.transform = 'translate(' + s.x.toFixed(1) + 'px,' + s.y.toFixed(1) + 'px)' + ax;
+    const far = 2.4 * VIEW_DIST;
+    const fade = s.depth > far ? Math.max(0, 1 - (s.depth - far) / (far * 0.5)) : 1;
+    o.el.style.opacity = String(0.16 + 0.84 * fade);
+  }
+}
+
+/* ---------------- 场景绘制 ---------------- */
+function drawScene(){
+  const b0 = LAY.blocks[0], open = S.expandW;
+  const st = STAGES[S.stage];
+  const pulse = 0.5 + 0.5 * Math.sin(S.pulse * 3.4);
+  const prog = S.t / st.dur;
+
+  /* ★ 两套视图的分派：解剖视图走自己的绘制（§5） */
+  if (S.mode === 'anatomy'){ drawAnatomy(pulse, st, prog); return; }
+
+  /* ---- token 方块 ---- */
+  for (let i = 0; i < LAY.n; i++){
+    const isGen = i >= PROMPT_TOKENS.length;
+    const cx = LAY.tokX(i), cy = LAY.tokY, s = LAY.cube;
+    const base = isGen ? C('#245347', 0.98) : C('#22345c', 0.98);
+    const hl = (st.id === 'tokens' || st.loop) ? 0.35 : 0;
+    box(BUF_OPAQUE, cx, cy, 0.6, s, s, s, mixC(base, COL.amber, hl * pulse), 0.05);
+    box(BUF_GLASS, cx, cy, 0.6, s*1.06, s*1.06, s*1.06, isGen ? C('#2f9e86', 0.16) : C('#5b86d6', 0.12), 0.6);
+  }
+
+  /* ---- 嵌入层 ---- */
+  const eHl = st.id === 'embed' ? (0.35 + 0.5*pulse) : 0;
+  box(BUF_OPAQUE, 0, LAY.embedY, 0, LAY.embedW, 0.42, 1.5, mixC(COL.body, COL.amber, eHl*0.28), eHl);
+  if (eHl > 0.05) wireBox(BUF_GLASS, 0, LAY.embedY, 0, LAY.embedW+0.16, 0.58, 1.66, 0.028, C('#d9b56a', 0.15+0.35*pulse), 1);
+  /* 位置编码小盒 */
+  const peX = LAY.embedW/2 + 0.55;
+  box(BUF_OPAQUE, peX, LAY.embedY, 0, 0.62, 0.42, 1.1, C('#28324c', 0.96), 0.05);
+
+  /* ---- Decoder 块 ---- */
+  for (let i = 0; i < NBLOCK; i++){
+    const b = LAY.blocks[i];
+    const isAct = (st.active === 'b' + i) || (st.active === 'b0' && i === 0);
+    const hl = isAct ? (0.30 + 0.55*pulse) : 0;
+    const cy = (b.y0 + b.y1)/2;
+    if (b.open > 0.02){
+      /* 打开状态：只留骨架 + 很淡的体块，让内部看得见 */
+      box(BUF_GLASS, 0, cy, 0, BLOCK_W, b.h, BLOCK_D, mixC(C('#141a2c', 0.10), COL.amber, hl*0.12), 0.02);
+      wireBox(BUF_GLASS, 0, cy, 0, BLOCK_W, b.h, BLOCK_D, 0.03, mixC(COL.bodyEdge, COL.amber, hl*0.9), hl > 0.05 ? 1 : 0.2);
+    } else {
+      box(BUF_OPAQUE, 0, cy, 0, BLOCK_W, b.h, BLOCK_D, mixC(COL.body, COL.amber, hl*0.14), hl);
+      box(BUF_GLASS, 0, cy, 0, BLOCK_W+0.14, b.h+0.1, BLOCK_D+0.14, mixC(C('#2a3450', 0.08), COL.amber, hl*0.4), 0.16);
+      if (hl > 0.05) wireBox(BUF_GLASS, 0, cy, 0, BLOCK_W+0.2, b.h+0.16, BLOCK_D+0.2, 0.03, C('#d9b56a', 0.2+0.5*pulse), 1);
+    }
+  }
+
+  /* ---- 块 1 内部：五个子模块 + 两条残差旁路 ---- */
+  if (open > 0.02){
+    const a = open;
+    const subHl = (key) => (st.sub === key ? (0.45 + 0.55*pulse) : 0);
+
+    /* LayerNorm ① */
+    let hl = subHl('ln1');
+    box(BUF_OPAQUE, 0, LAY.sub.ln1.cy, 0.5, 3.0, LAY.sub.ln1.h, 1.3, mixC(COL.lnBody, COL.amber, hl*0.26), hl, a);
+    if (hl > 0.05) wireBox(BUF_GLASS, 0, LAY.sub.ln1.cy, 0.5, 3.12, LAY.sub.ln1.h+0.1, 1.42, 0.022, C('#d9b56a', 0.25+0.5*pulse), 1);
+    /* 掩码多头自注意力 */
+    hl = subHl('mha');
+    box(BUF_OPAQUE, 0, LAY.sub.mha.cy, 0, 4.9, LAY.sub.mha.h, 2.0, mixC(COL.subBody, COL.amber, hl*0.24), hl, a);
+    if (hl > 0.05) wireBox(BUF_GLASS, 0, LAY.sub.mha.cy, 0, 5.02, LAY.sub.mha.h+0.1, 2.12, 0.022, C('#d9b56a', 0.22+0.45*pulse), 1);
+    /* Add & Norm ① */
+    hl = subHl('add1');
+    box(BUF_OPAQUE, 0, LAY.sub.add1.cy, 0.5, 3.0, LAY.sub.add1.h, 1.3, mixC(COL.addBody, COL.amber, hl*0.26), hl, a);
+    if (hl > 0.05) wireBox(BUF_GLASS, 0, LAY.sub.add1.cy, 0.5, 3.12, LAY.sub.add1.h+0.1, 1.42, 0.022, C('#d9b56a', 0.25+0.5*pulse), 1);
+    /* MLP */
+    hl = subHl('mlp');
+    box(BUF_OPAQUE, 0, LAY.sub.mlp.cy, 0, 4.6, LAY.sub.mlp.h, 2.0, mixC(COL.subBody, COL.amber, hl*0.24), hl, a);
+    if (hl > 0.05) wireBox(BUF_GLASS, 0, LAY.sub.mlp.cy, 0, 4.72, LAY.sub.mlp.h+0.1, 2.12, 0.022, C('#d9b56a', 0.22+0.45*pulse), 1);
+    /* Add & Norm ② */
+    hl = subHl('add2');
+    box(BUF_OPAQUE, 0, LAY.sub.add2.cy, 0.5, 3.0, LAY.sub.add2.h, 1.3, mixC(COL.addBody, COL.amber, hl*0.26), hl, a);
+    if (hl > 0.05) wireBox(BUF_GLASS, 0, LAY.sub.add2.cy, 0.5, 3.12, LAY.sub.add2.h+0.1, 1.42, 0.022, C('#d9b56a', 0.25+0.5*pulse), 1);
+
+    /* 五个子模块统一描一圈金边：暗底上才读得出每块的边界 */
+    for (const sb of [['ln1',0,0.5,3.0,1.3],['mha',0,0,4.9,2.0],['add1',0,0.5,3.0,1.3],
+                      ['mlp',0,0,4.6,2.0],['add2',0,0.5,3.0,1.3]]){
+      const s2 = LAY.sub[sb[0]];
+      wireBox(BUF_GLASS, sb[1], s2.cy, sb[2], sb[3]+0.05, s2.h+0.05, sb[4]+0.05,
+              0.012, C('#d9b56a', 0.36*a), 0.28);
+    }
+
+    /* 残差旁路：贴着模块左侧向上绕过去，再横向汇进 Add&Norm */
+    const xr = -2.86, zr = 1.42, xIn = -1.55;
+    const resC = C('#7f9fd0', 0.9*a);
+    const segs = [
+      [LAY.sub.ln1.y0 - 0.12, LAY.sub.add1.cy],   // 输入 → Add&Norm①
+      [LAY.sub.add1.cy, LAY.sub.add2.cy]          // Add&Norm① → Add&Norm②
+    ];
+    for (const seg of segs){
+      beam(BUF_OPAQUE, xIn, seg[0], 0.5, xr, seg[0], zr, 0.06, resC);
+      beam(BUF_OPAQUE, xr, seg[0], zr, xr, seg[1], zr, 0.06, resC);
+      beam(BUF_OPAQUE, xr, seg[1], zr, xIn, seg[1], 0.5, 0.06, resC);
+      box(BUF_OPAQUE, xIn+0.06, seg[1], 0.5, 0.18, 0.18, 0.18, C('#cfe0f8', 0.95*a), 0.25);
+    }
+
+    /* 子模块之间的竖向连接 */
+    const connC = C('#d9b56a', 0.55*a);
+    beam(BUF_OPAQUE, 0, LAY.sub.ln1.y1, 0.5, 0, LAY.sub.mha.y0, 0.5, 0.06, connC);
+    beam(BUF_OPAQUE, 0, LAY.sub.mha.y1, 0.5, 0, LAY.sub.add1.y0, 0.5, 0.08, connC);
+    beam(BUF_OPAQUE, 0, LAY.sub.add1.y1, 0.5, 0, LAY.sub.mlp.y0, 0.5, 0.08, connC);
+    beam(BUF_OPAQUE, 0, LAY.sub.mlp.y1, 0.5, 0, LAY.sub.add2.y0, 0.5, 0.08, connC);
+  }
+
+  /* ---- 块之间的竖向连接 ---- */
+  for (let i = 0; i + 1 < NBLOCK; i++){
+    const a = LAY.blocks[i], b = LAY.blocks[i+1];
+    beam(BUF_OPAQUE, 0, a.y1, 0, 0, b.y0, 0, 0.075, C('#d9b56a', 0.55));
+  }
+
+  /* ---- 「⋮ ×12」 ---- */
+  for (let k = 0; k < 3; k++){
+    const y = LAY.stackTop + 0.22 + k*0.19;
+    box(BUF_OPAQUE, 0, y, 0, 0.34, 0.09, 0.34, C('#2a3450', 0.9), 0.05);
+  }
+
+  /* ---- 最终 LayerNorm ---- */
+  const fHl = st.id === 'final' ? (0.35 + 0.55*pulse) : 0;
+  box(BUF_OPAQUE, 0, LAY.finalY, 0.4, 2.1, 0.34, 1.2, mixC(COL.lnBody, COL.amber, fHl*0.28), fHl);
+  if (fHl > 0.05) wireBox(BUF_GLASS, 0, LAY.finalY, 0.4, 2.3, 0.5, 1.4, 0.028, C('#d9b56a', 0.2+0.45*pulse), 1);
+
+  /* ---- Logits 面板 + 概率条 ---- */
+  const lHl = (st.id === 'logits' || st.loop) ? (0.3 + 0.45*pulse) : 0;
+  box(BUF_OPAQUE, 0, LAY.logitsY - 0.62, 0, 5.2, 0.16, 1.4, mixC(C('#1a2440', 0.95), COL.amber, lHl*0.4), lHl*0.5);
+  const dist = probDist(S.gen), top = dist.list[0].p;
+  const bars = Math.min(8, dist.list.length);
+  for (let k = 0; k < bars; k++){
+    const p = dist.list[k].p, hh = 0.28 + 1.35 * (p / top);
+    const bx = (k - (bars-1)/2) * 0.62;
+    const isTop = k === 0;
+    const col = isTop ? mixC(COL.amber, C('#f7ecd0', 1), lHl*0.3) : C('#3a5a8f', 0.95);
+    box(BUF_OPAQUE, bx, LAY.logitsY - 0.54 + hh/2, 0, 0.34, hh, 0.34, col, isTop ? (0.25 + 0.5*pulse*lHl) : 0.05);
+  }
+
+  /* ---- 注意力矩阵（贴在 MHA 盒子正面，先用深色底板再画格子，颜色才干净） ---- */
+  if (S.mhaE > 0.03){
+    const n = LAY.n, info = attention(S.layer, S.head, S.tokens);
+    const cell = Math.min(0.46, 2.40 / Math.max(1, n)), gap = 0.06;
+    const gw = n*cell + (n-1)*gap;
+    const gx = 0.62, gy = LAY.sub.mha.cy, gz = 1.03;
+    /* 暂停/定帧时整张矩阵都要可见；播放时才逐行揭开 */
+    const reveal = (st.sub === 'mha' && S.playing) ? clamp01(0.45 + S.t / (st.dur*0.7)) * (n + 1) : n + 1;
+    /* 底板：让格子的留缝是深色，而不是模块的蓝灰 */
+    box(BUF_OPAQUE, gx, gy, gz - 0.03, gw + 0.20, gw + 0.20, 0.02, C('#0a1120', 0.97 * S.mhaE), 0.02);
+    gridPanel(BUF_OPAQUE, gx, gy, gz, cell, gap, n, n, (r, c) => {
+      const vis = clamp01(reveal - r);
+      if (vis <= 0.02) return null;
+      if (info.masked[r][c]){
+        return { c:[0.36, 0.12, 0.17, 0.92 * vis * S.mhaE], g:0 };       // 被掩码：暗朱砂
+      }
+      const w = info.w[r][c];
+      const t = Math.pow(w, 0.55);
+      const cc = mixC(C('#24406b', 0.96), C('#f0d9a4', 1.0), t);
+      cc[3] = (0.55 + 0.45*t) * vis * S.mhaE;
+      return { c: cc, g: 0.18 + 0.5*t };
+    });
+    /* 矩阵外框（金线） */
+    wireBox(BUF_GLASS, gx, gy, gz, gw + 0.20, gw + 0.20, 0.02, 0.014, C('#d9b56a', 0.55*S.mhaE), 0.6);
+    /* 左边四条头轨：只有当前选中的那条亮 */
+    /* 左边 12 条头轨：只有当前选中的那条亮 */
+    for (let h = 0; h < NHEAD; h++){
+      const hy = gy + 0.86 - h * 0.155;
+      box(BUF_OPAQUE, -1.78, hy, 1.02, 0.30, 0.085, 0.05,
+          h === S.head ? C('#e8c78a', 1.0) : C('#2a3854', 0.95),
+          h === S.head ? 0.6 : 0.03, S.mhaE);
+    }
+  }
+
+  /* ---- MLP 三条柱状带（768 → 3072 → 768） ---- */
+  if (S.mlpE > 0.03){
+    const grow = (st.sub === 'mlp') ? ease(clamp01(S.t/(st.dur*0.7))) : 1;
+    const baseY = LAY.sub.mlp.cy - 0.34;
+    const groups = [
+      { x:-1.62, n:5, hMax:0.52, col:C('#3a5a8f', 0.95) },
+      { x: 0.00, n:9, hMax:0.95, col:C('#4a74b8', 0.95) },
+      { x: 1.62, n:5, hMax:0.52, col:C('#3a5a8f', 0.95) }
+    ];
+    const bw = 0.17, bgap = 0.085;
+    /* 底部基座，让柱子和"矩阵"感觉更清楚 */
+    box(BUF_OPAQUE, 0, baseY - 0.04, 1.06, 4.2, 0.06, 0.14, C('#1d2a4a', 0.9*S.mlpE), 0.05);
+    for (const g of groups){
+      for (let k = 0; k < g.n; k++){
+        const v = 0.30 + 0.70 * Math.abs(Math.sin(k*1.9 + g.n*0.7 + S.stage*0.6));
+        const hh = 0.10 + g.hMax * v * grow * S.mlpE;
+        const x = g.x + (k - (g.n-1)/2) * (bw + bgap);
+        box(BUF_OPAQUE, x, baseY + hh/2, 1.06, bw, hh, 0.10, g.col, 0.30);
+      }
+    }
+    /* 两组权重矩阵的箭头（细竖梁） */
+    box(BUF_OPAQUE, -0.82, baseY + 0.34, 1.06, 0.05, 0.68, 0.05, C('#b9cdf0', 0.5*S.mlpE), 0.1);
+    box(BUF_OPAQUE,  0.82, baseY + 0.34, 1.06, 0.05, 0.68, 0.05, C('#b9cdf0', 0.5*S.mlpE), 0.1);
+  }
+
+  /* ---- 正在搬运的张量：一个整体方块（没有粒子） ---- */
+  const target = anchorOf(S.stage, prog);
+  const tp = clamp01(S.t / 0.55);
+  const cube = [
+    lerp(S.cubeFrom[0], target[0], ease(tp)),
+    lerp(S.cubeFrom[1], target[1], ease(tp)),
+    lerp(S.cubeFrom[2], target[2], ease(tp))
+  ];
+  S.cube = cube;
+  const cs = 0.40;
+  box(BUF_GLASS, cube[0], cube[1], cube[2], cs, cs, cs, C('#5b86d6', 0.30), 0.9);
+  wireBox(BUF_OPAQUE, cube[0], cube[1], cube[2], cs*1.02, cs*1.02, cs*1.02, 0.02, C('#a8c4f0', 0.95), 1);
+
+  /* ---- 自回归：新的 token 从 logits 飞回句尾（绿色方块） ---- */
+  if (st.loop){
+    const k = clamp01((S.t - 1.1) / 1.6);
+    const from = [0, LAY.logitsY - 0.2, 1.1];
+    const to = [LAY.tokX(LAY.n) + 0.0, LAY.tokY, 0.6];
+    const e = ease(k);
+    const gx2 = lerp(from[0], to[0], e), gy2 = lerp(from[1], to[1], e), gz2 = lerp(from[2], to[2], e);
+    if (k > 0.01){
+      box(BUF_GLASS, gx2, gy2, gz2, 0.46, 0.46, 0.46, C('#2f9e86', 0.22 + 0.3*Math.sin(S.pulse*5)*0.5 + 0.15), 0.8);
+      wireBox(BUF_OPAQUE, gx2, gy2, gz2, 0.48, 0.48, 0.48, 0.02, C('#9fe8cc', 0.9), 1);
+    }
+  }
+}
+
+/* ---------------- 相机 ---------------- */
+function updateCamera(dt){
+  const st = STAGES[S.stage];
+  const ct = cameraTargetOf(S.stage);
+
+  if (S.follow){
+    const k = 1 - Math.exp(-dt * 3.2);
+    CAM.tgt[0] = lerp(CAM.tgt[0], ct.p[0], k);
+    CAM.tgt[1] = lerp(CAM.tgt[1], ct.p[1], k);
+    CAM.tgt[2] = lerp(CAM.tgt[2], ct.p[2], k);
+    CAM.dist = lerp(CAM.dist, ct.d, k);
+  } else {
+    CAM.dist = lerp(CAM.dist, CAM.baseDist || CAM.dist, 1 - Math.exp(-dt*3));
+  }
+
+  const fov0 = 42, fov1 = 3.4;
+  const fov = lerp(fov0, fov1, S.viewT) * Math.PI/180;
+  const distEff = CAM.dist * CAM.zoom * (Math.tan(fov0*Math.PI/360) / Math.tan(fov/2));
+  const az = lerp(CAM.az, 0.0001, S.viewT);
+  const el = lerp(CAM.el, 0.0001, S.viewT);
+  const eye = [
+    CAM.tgt[0] + distEff * Math.cos(el) * Math.sin(az),
+    CAM.tgt[1] + distEff * Math.sin(el),
+    CAM.tgt[2] + distEff * Math.cos(el) * Math.cos(az)
+  ];
+  VIEW_DIST = distEff;
+  m4persp(PROJ, fov, W/H, Math.max(0.1, distEff*0.01), distEff*8 + 200);
+  m4lookAt(VIEW, eye, CAM.tgt, [0,1,0]);
+  m4mul(VP, PROJ, VIEW);
+  return eye;
+}
+
+/* ---------------- 每帧 ---------------- */
+let LIVE_NODE = null;
+function frame(now){
+  const dt = Math.min(0.05, (now - (frame.last || now)) / 1000) || 0;
+  frame.last = now;
+  S.pulse += dt;
+
+  /* 时间推进 */
+  if (S.playing){
+    S.t += dt * S.speed;
+    const dur = STAGES[S.stage].dur;
+    if (S.t >= dur){ S.t = 0; advance(1); }
+  }
+
+  /* 展开进度 */
+  const st = STAGES[S.stage];
+  const wantOpen = st.sub ? 1 : 0;
+  S.expandW = lerp(S.expandW, wantOpen, 1 - Math.exp(-dt*5));
+  S.mhaE    = lerp(S.mhaE, st.id === 'mha' ? 1 : 0, 1 - Math.exp(-dt*5));
+  S.mlpE    = lerp(S.mlpE, st.id === 'mlp' ? 1 : 0, 1 - Math.exp(-dt*5));
+  S.viewT   = lerp(S.viewT, S.view2d ? 1 : 0, 1 - Math.exp(-dt*4));
+
+  computeLayout();
+  const eye = updateCamera(dt);
+  EYE[0] = eye[0]; EYE[1] = eye[1]; EYE[2] = eye[2];   // 弧线要朝着相机才好看
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.031, 0.024, 0.055, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(uVP, false, VP);
+  gl.uniform3fv(uEye, eye);
+
+  BUF_OPAQUE.n = 0; BUF_GLASS.n = 0;
+  drawScene();
+
+  gl.depthMask(true);
+  drawBuf(BUF_OPAQUE);
+  gl.depthMask(false);
+  drawBuf(BUF_GLASS);
+  gl.depthMask(true);
+
+  updateLabels();
+  updateHudLive();
+  if (LIVE_NODE) LIVE_NODE.textContent = JSON.stringify({
+    stage:S.stage, t:+S.t.toFixed(2),
+    tgt:[+CAM.tgt[0].toFixed(2), +CAM.tgt[1].toFixed(2), +CAM.tgt[2].toFixed(2)],
+    dist:+CAM.dist.toFixed(1), ex:+S.expandW.toFixed(2), mha:+S.mhaE.toFixed(2), mlp:+S.mlpE.toFixed(2),
+    view:+S.viewT.toFixed(2), n:LAY.n, tokens:S.tokens.slice(),
+    bh: LAY.blocks.map(b=>+b.h.toFixed(2)), subY: Object.keys(LAY.sub).map(k=>+LAY.sub[k].cy.toFixed(2)),
+    openH:+LAY.openH.toFixed(2), fov:+CAM.fov.toFixed(1), zoom:+CAM.zoom.toFixed(2)
+  });
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 阶段切换 ---------------- */
+function setStage(i, keepPlaying){
+  S.stage = ((i % STAGES.length) + STAGES.length) % STAGES.length;
+  /* 走门廊时层号跟着当前那道门走（用户手动点过层按钮就不再抢） */
+  if (!S.layerLock && GATE_OF_STAGE[S.stage]) S.layer = Math.max(0, Math.min(11, GATE_OF_STAGE[S.stage] - 1));
+  S.t = 0;
+  S.cubeFrom = S.cube ? S.cube.slice() : anchorOf(S.stage, 0);
+  S.stageTimer = 0;
+  syncSide();
+  syncStageList();
+  syncDock();
+}
+function appendToken(){
+  /* 真模型的下一个词是 " that"（18.0%）。接上它以后我们再跑了一次前向，
+     所以 6 个 token 的注意力矩阵也是真的；只够接一个词，所以到 6 就重置。 */
+  if (S.tokens.length >= MAX_TOKENS){
+    S.tokens = PROMPT_TOKENS.slice();
+    S.gen = 0;
+    return false;
+  }
+  S.tokens.push(GEN_REAL);
+  S.gen++;
+  return true;
+}
+function advance(dir){
+  const last = STAGES.length - 1;
+  if (dir > 0){
+    if (S.stage === last){          /* 走完一轮：追加 token，再从头跑（自回归） */
+      appendToken();
+      setStage(1);
+    } else setStage(S.stage + 1);
+  } else {
+    if (S.stage === 0) setStage(last);
+    else setStage(S.stage - 1);
+  }
+}
+
+/* ---------------- 右侧面板 ---------------- */
+const elBadge = document.getElementById('stBadge');
+const elTitle = document.getElementById('stTitle');
+const elText  = document.getElementById('stText');
+const elShape = document.getElementById('stShapes');
+const cardMha = document.getElementById('mhaCard');
+const cardMlp = document.getElementById('mlpCard');
+const cardProb = document.getElementById('probsCard');
+const cardStack = document.getElementById('stackCard');
+const tblBox  = document.getElementById('attnTbl');
+const headTabs = document.getElementById('headTabs');
+const probsList = document.getElementById('probsList');
+const elModeText = document.getElementById('modeText');
+const elAnatCard = document.getElementById('anatCard');
+const qTabsEl = document.getElementById('qTabs');
+const eqBar = document.getElementById('eqBar');
+const eqLH = document.getElementById('eqLH');
+
+function syncSide(){
+  const st = STAGES[S.stage];
+  elBadge.textContent = st.badge;
+  elTitle.textContent = st.title;
+  elText.innerHTML = st.text;
+
+  const parts = String(st.shapes).split('→');
+  elShape.innerHTML = parts.map((s, i) =>
+    (i ? '<span class="ar">→</span>' : '') + '<span class="s">' + esc(s.trim()) + '</span>'
+  ).join('');
+
+  cardMha.style.display = st.mha ? 'block' : 'none';
+  if (eqBar){
+    eqBar.classList.toggle('on', !!st.mha);
+    if (st.mha) eqLH.textContent = 'L' + (S.mode === 'anatomy' ? Math.max(1, Math.min(4, stGateNow())) : (S.layer + 1)) + ' · H' + (S.head + 1);
+  }
+  cardMlp.style.display = st.mlp ? 'block' : 'none';
+  cardProb.style.display = st.probs ? 'block' : 'none';
+  cardStack.style.display = (st.id === 'stack' || st.id === 'pass') ? 'block' : 'none';
+
+  if (st.mha) syncAttnTable();
+  if (st.probs) syncProbs();
+  syncModePanel();
+}
+
+/* ---------------- 视图说明卡 + 查询词 ---------------- */
+let qTabSeen = -1;
+function syncModePanel(){
+  const box = (S.mode === 'box');
+  elModeText.innerHTML = box
+    ? '整页默认是 <b>结构框图</b>：一摞模块 + 一个张量方块，按「下一步」看数据一格一格往上搬，' +
+      '到哪个模块哪个模块亮。想看清 token 之间怎么交换信息，切到 <b>向量解剖</b>。'
+    : '现在是 <b>词珠长廊</b>（照第一版的「门廊」做的）：一道门是一层，门一道套一道往深处退；' +
+      '每颗珠子是一个 token 在该层的 768 维向量，珠子串在柱子上就是<b>残差流</b>，门里那几条拱起的弧是<b>注意力</b>' +
+      '（越粗越亮权重越大）。走一步，往里多开一道门；下面可以选一个词，只看它把注意力投给了谁。';
+  elAnatCard.style.display = box ? 'none' : 'block';
+  document.getElementById('modeBtnBox').classList.toggle('on', box);
+  document.getElementById('modeBtnAnat').classList.toggle('on', !box);
+  document.getElementById('legendBox').style.display  = box ? 'flex' : 'none';
+  document.getElementById('legendAnat').style.display = box ? 'none' : 'flex';
+  buildQTabs();
+  syncQTabs();
+}
+function buildQTabs(){
+  const n = S.tokens.length;
+  if (n === qTabSeen) return;
+  qTabSeen = n;
+  qTabsEl.innerHTML = '';
+  const mk = (label, idx) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = () => { S.qIdx = idx; syncQTabs(); };
+    qTabsEl.appendChild(b);
+    return b;
+  };
+  mk('全部', -1);
+  for (let i = 0; i < n; i++) mk(S.tokens[i], i);
+  if (S.qIdx >= n) S.qIdx = -1;
+}
+function syncQTabs(){
+  if (!qTabsEl) return;
+  const bs = qTabsEl.querySelectorAll('button');
+  bs.forEach((b, k) => b.classList.toggle('on', (k === 0 && S.qIdx < 0) || (k - 1 === S.qIdx)));
+}
+function syncAttnTable(){
+  const n = LAY.n || S.tokens.length, info = attention(S.layer, S.head, S.tokens);
+  let h = '<table class="attn"><tr><th>Q\\K</th>';
+  for (let j = 0; j < n; j++) h += '<th>' + esc(S.tokens[j]) + '</th>';
+  h += '</tr>';
+  for (let i = 0; i < n; i++){
+    h += '<tr><th>' + esc(S.tokens[i]) + '</th>';
+    let mx = -1, arg = 0;
+    for (let j = 0; j < n; j++) if (info.w[i][j] > mx){ mx = info.w[i][j]; arg = j; }
+    for (let j = 0; j < n; j++){
+      if (info.masked[i][j]) h += '<td class="msk">·</td>';
+      else if (j === arg) h += '<td class="hot">' + info.w[i][j].toFixed(2) + '</td>';
+      else h += '<td>' + info.w[i][j].toFixed(2) + '</td>';
+    }
+    h += '</tr>';
+  }
+  h += '</table>';
+  tblBox.innerHTML = h;
+}
+function syncProbs(){
+  const dist = probDist(S.gen);
+  let h = '';
+  for (let i = 0; i < Math.min(5, dist.list.length); i++){
+    const r = dist.list[i];
+    h += '<div class="prow' + (i === 0 ? ' top' : '') + '">' +
+         '<span class="w">' + esc(r.w) + '</span>' +
+         '<span class="bar"><i style="width:' + (r.p*100/Math.max(0.01,dist.list[0].p)).toFixed(1) + '%"></i></span>' +
+         '<span class="v">' + (r.p*100).toFixed(1) + '%</span></div>';
+  }
+  h += '<div class="prow"><span class="w" style="color:var(--faint)">其他</span>' +
+       '<span class="bar"><i style="width:' + (dist.rest*100/Math.max(0.01,dist.list[0].p)).toFixed(1) + '%;background:rgba(120,190,255,.3)"></i></span>' +
+       '<span class="v">' + (dist.rest*100).toFixed(0) + '%</span></div>';
+  probsList.innerHTML = h;
+}
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+/* ---------------- 阶段表 / 控制条同步 ---------------- */
+const stageListEl = document.getElementById('stageList');
+const stageBtns = [];
+function buildStageList(){
+  for (let i = 0; i < STAGES.length; i++){
+    const b = document.createElement('button');
+    b.innerHTML = '<span class="n">' + String(i+1).padStart(2,'0') + '</span>' + esc(STAGES[i].name);
+    b.onclick = () => { S.playing = false; setStage(i); syncDock(); };
+    stageListEl.appendChild(b);
+    stageBtns.push(b);
+  }
+}
+function syncStageList(){
+  stageBtns.forEach((b, i) => b.classList.toggle('on', i === S.stage));
+}
+const btnPlay = document.getElementById('btnPlay');
+const progFill = document.getElementById('progFill');
+const stepNo = document.getElementById('stepNo');
+function syncDock(){
+  btnPlay.textContent = S.playing ? '❚❚ 暂停' : '▶ 播放';
+  btnPlay.classList.toggle('on', S.playing);
+  stepNo.textContent = String(S.stage+1).padStart(2,'0') + '/' + STAGES.length;
+  document.getElementById('btn2d').classList.toggle('on', S.view2d);
+  document.getElementById('btnFollow').classList.toggle('on', S.follow);
+}
+function updateHudLive(){
+  progFill.style.width = (clamp01(S.t / STAGES[S.stage].dur) * 100).toFixed(1) + '%';
+}
+
+/* ---------------- 交互 ---------------- */
+let drag = null;
+canvas.addEventListener('pointerdown', e => {
+  drag = { x:e.clientX, y:e.clientY };
+  canvas.classList.add('dragging');
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  drag.x = e.clientX; drag.y = e.clientY;
+  CAM.az -= dx * 0.006;
+  CAM.el = Math.max(-0.35, Math.min(1.25, CAM.el + dy * 0.005));
+  if (S.view2d){ S.view2d = false; syncDock(); }   // 在 2D 里拖动 → 回到 3D
+});
+canvas.addEventListener('pointerup', e => { drag = null; canvas.classList.remove('dragging'); });
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  CAM.zoom = Math.max(0.45, Math.min(2.2, CAM.zoom * (1 + Math.sign(e.deltaY) * 0.08)));
+}, { passive:false });
+
+function togglePlay(){ S.playing = !S.playing; syncDock(); }
+document.getElementById('btnPlay').onclick = togglePlay;
+document.getElementById('btnNext').onclick = () => { S.playing = false; advance(1); syncDock(); };
+document.getElementById('btnPrev').onclick = () => { S.playing = false; advance(-1); syncDock(); };
+document.getElementById('btnReset').onclick = () => {
+  S.tokens = PROMPT_TOKENS.slice(); S.gen = 0; S.playing = false;
+  CAM.az = 0.58; CAM.el = 0.26; CAM.zoom = 1; CAM.dist = 20; CAM.tgt = [0, 5.4, 0];
+  S.view2d = false; S.follow = true;
+  setStage(0); syncDock();
+};
+document.getElementById('btn2d').onclick = () => { S.view2d = !S.view2d; syncDock(); };
+
+/* ---------- 两套视图切换（框图 / 解剖）---------- */
+function setMode(m){
+  if (S.mode === m) return;
+  S.mode = m;
+  S.cubeFrom = S.cube ? S.cube.slice() : S.cubeFrom;
+  CAM.az = (m === 'anatomy') ? 0.115 : 0.58;
+  CAM.el = (m === 'anatomy') ? 0.105 : 0.26;
+  snapView();
+  syncSide(); syncDock();
+}
+document.getElementById('modeBtnBox').onclick  = () => setMode('box');
+document.getElementById('modeBtnAnat').onclick = () => setMode('anatomy');
+document.getElementById('btnModeBox').onclick  = () => { setMode('box'); };
+document.getElementById('btnModeAnat').onclick = () => { setMode('anatomy'); };
+document.getElementById('btnFollow').onclick = () => {
+  S.follow = !S.follow;
+  if (!S.follow) CAM.baseDist = CAM.dist;
+  syncDock();
+};
+document.getElementById('speed').oninput = e => { S.speed = parseFloat(e.target.value); };
+document.getElementById('btnHelp').onclick = () => document.getElementById('help').classList.add('on');
+document.getElementById('btnArch').onclick = () => document.getElementById('arch').classList.add('on');
+document.querySelectorAll('[data-close]').forEach(b => {
+  b.onclick = () => document.getElementById(b.getAttribute('data-close')).classList.remove('on');
+});
+document.querySelectorAll('.overlay').forEach(o => {
+  o.addEventListener('click', e => { if (e.target === o) o.classList.remove('on'); });
+});
+
+/* 层页签 / 头页签 / 每层首词占比柱 —— 全部来自真实权重 */
+const layerTabs = document.getElementById('layerTabs');
+const sinkChart = document.getElementById('sinkChart');
+(function buildTabs(){
+  for (let l = 0; l < 12; l++){
+    const b = document.createElement('button');
+    b.textContent = 'L' + (l+1);
+    b.title = '第 ' + (l+1) + ' 层：整层首词占比 ' + (realBundle(5).layerSink[l]*100).toFixed(1) + '%';
+    b.onclick = () => { S.layer = l; S.layerLock = true; S.head = 0; syncHeads(); syncLayers(); syncAttnTable(); syncSink(); };
+    layerTabs.appendChild(b);
+  }
+  for (let h = 0; h < NHEAD; h++){
+    const b = document.createElement('button');
+    b.textContent = 'H' + (h+1);
+    b.onclick = () => { S.head = h; syncHeads(); syncAttnTable(); };
+    headTabs.appendChild(b);
+  }
+  const B0 = realBundle(5);
+  for (let l = 0; l < 12; l++){
+    const d = document.createElement('div');
+    d.className = 'b';
+    d.style.height = Math.max(3, B0.layerSink[l] * 100) + '%';
+    d.onclick = () => { S.layer = l; S.layerLock = true; syncLayers(); syncAttnTable(); syncSink(); };
+    sinkChart.appendChild(d);
+  }
+  const cap = document.createElement('span');
+  cap.className = 'cap';
+  cap.textContent = 'L1–L12 每层的「首词注意力占比」（真数据，L8 最高 92.3%）';
+  sinkChart.appendChild(cap);
+})();
+function syncHeads(){
+  const hl = LBL.find(function(o){ return o.el && o.el.className.indexOf('lbl-head') >= 0; });
+  if (hl){ const t = 'H' + (S.head + 1) + ' 头轨'; hl.el.textContent = t; hl.lastText = t; }
+  const bs = headTabs.querySelectorAll('button');
+  bs.forEach((b, i) => {
+    b.classList.toggle('on', i === S.head);
+    const pr = headProfile(S.layer, i);
+    b.title = 'L' + (S.layer+1) + ' H' + (i+1) +
+              '：首词 ' + (pr[0]*100).toFixed(0) + '% · 前词 ' + (pr[1]*100).toFixed(0) +
+              '% · 自身 ' + (pr[2]*100).toFixed(0) + '% · 熵 ' + pr[3].toFixed(2);
+  });
+}
+function syncLayers(){
+  const bs = layerTabs.querySelectorAll('button');
+  bs.forEach((b, i) => b.classList.toggle('on', i === S.layer));
+}
+function syncSink(){
+  const bs = sinkChart.querySelectorAll('.b');
+  bs.forEach((b, i) => b.classList.toggle('on', i === S.layer));
+}
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space'){ e.preventDefault(); togglePlay(); return; }
+  if (e.key === 'ArrowRight'){ S.playing = false; advance(1); syncDock(); }
+  if (e.key === 'ArrowLeft'){ S.playing = false; advance(-1); syncDock(); }
+  if (e.key === '1'){ S.view2d = false; syncDock(); }
+  if (e.key === 'm' || e.key === 'M'){ setMode(S.mode === 'box' ? 'anatomy' : 'box'); }
+  if (e.key === '2'){ S.view2d = true; syncDock(); }
+  if (e.key === 'f' || e.key === 'F'){ document.getElementById('btnFollow').click(); }
+  if (e.key === 'r' || e.key === 'R'){ document.getElementById('btnReset').click(); }
+  if (e.key === 'h' || e.key === 'H'){ document.getElementById('help').classList.toggle('on'); }
+  if (e.key === 'q' || e.key === 'Q'){ S.head = (S.head + NHEAD_DRAW - 1) % NHEAD_DRAW; syncHeads(); syncAttnTable(); }
+  if (e.key === 'e' || e.key === 'E'){ S.head = (S.head + 1) % NHEAD_DRAW; syncHeads(); syncAttnTable(); }
+});
+
+/* ---------------- 尺寸 ---------------- */
+function resize(){
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.floor(W * DPR);
+  canvas.height = Math.floor(H * DPR);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+}
+window.addEventListener('resize', resize);
+
+/* ---------------- 启动 ---------------- */
+/* 把相机与展开进度瞬间对齐到当前阶段（截图 / 直接定位用） */
+function snapView(){
+  computeLayout();
+  const ct = cameraTargetOf(S.stage);
+  CAM.tgt[0] = ct.p[0]; CAM.tgt[1] = ct.p[1]; CAM.tgt[2] = ct.p[2];
+  CAM.dist = ct.d;
+  const st = STAGES[S.stage];
+  S.expandW = st.sub ? 1 : 0;
+  S.mhaE = (st.id === 'mha') ? 1 : 0;
+  S.mlpE = (st.id === 'mlp') ? 1 : 0;
+  S.viewT = S.view2d ? 1 : 0;
+}
+
+function boot(){
+  resize();
+  initGL();
+  computeLayout();          // 先算一版布局，后面 setStage / 锚点都依赖它
+  buildStageList();
+  syncHeads();
+  /* 3D 文字层：模块名 / 形状 / token / 提示 */
+  const b = () => LAY.blocks;
+  addLabel('lbl-note', '↑ 张量自下而上 · 逐层前向传播', () => [-4.35, LAY.tokY + 1.0, 1.2], 'right');
+  for (let i = 0; i < MAX_TOKENS; i++){
+    addLabel('lbl-tok', '', () => {
+      if (i >= LAY.n) return null;
+      return [LAY.tokX(i), LAY.tokY - 0.62, 0.6];
+    }, 'center', i);
+  }
+  addLabel('lbl-mod', 'Token 嵌入 + 位置编码', () => [-LAY.embedW/2 - 0.3, LAY.embedY, 0.5], 'right');
+  addLabel('lbl-shape', '[n × 768]', () => [LAY.embedW/2 + 0.9, LAY.embedY, 0.2], 'left');
+  for (let i = 0; i < NBLOCK; i++){
+    addLabel('lbl-mod', 'Decoder 块 ' + (i+1), () => {
+      const bb = LAY.blocks[i];
+      if (bb.open > 0.35) return null;                  // 打开时用子模块标签
+      return [0, (bb.y0 + bb.y1)/2, BLOCK_D/2 + 0.1];
+    });
+  }
+  addLabel('lbl-note', '⋮ 共 12 层', () => [0.75, LAY.dotsY, 0]);
+  addLabel('lbl-mod', '最终 LayerNorm', () => [0, LAY.finalY + 0.42, 0.4]);
+  addLabel('lbl-mod', 'Logits → softmax', () => [0, LAY.logitsY + 1.18, 0]);
+  addLabel('lbl-shape', '下一个 token 概率', () => [0, LAY.logitsY + 0.72, 0]);
+
+  /* 子模块标签：统一排到块的外左侧，右对齐，绝不会压在模块上 */
+  const subLbl = (key, text) => addLabel('lbl-mod', text, () => {
+    if (S.expandW < 0.45) return null;
+    return [-3.82, LAY.sub[key].cy, 1.3];
+  }, 'right');
+  subLbl('ln1', '① LayerNorm · 逐位置归一化');
+  subLbl('mha', '② 掩码多头自注意力 · 12 头');
+  subLbl('add1', '③ 残差相加 + LayerNorm');
+  subLbl('mlp', '④ MLP · 768→3072→768');
+  subLbl('add2', '⑤ 残差相加 + LayerNorm → 下一块');
+
+  addLabel('lbl-tiny', '行 = 查询 ↓  列 = 键 →', () => {
+    if (S.mhaE < 0.4) return null;
+    const n = LAY.n, c2 = Math.min(0.46, 2.40/Math.max(1,n)), gw = n*c2 + (n-1)*0.06;
+    return [0.62 - gw/2 + 0.02, LAY.sub.mha.cy + gw/2 + 0.34, 1.05];
+  }, 'left');
+  addLabel('lbl-tiny', '右上角 = 被掩码的未来', () => {
+    if (S.mhaE < 0.4) return null;
+    const n = LAY.n, c2 = Math.min(0.46, 2.40/Math.max(1,n)), gw = n*c2 + (n-1)*0.06;
+    return [0.62 - gw/2 + 0.02, LAY.sub.mha.cy - gw/2 - 0.34, 1.05];
+  }, 'left');
+
+  /* 解剖视图的文字层（词名 / 层名 / 提示），默认隐藏，切过去才显示 */
+  addAnatLabels();
+  syncLayers(); syncSink();
+
+  syncSide();
+  syncStageList();
+  syncDock();
+  setStage(0);
+
+  /* 允许用 URL 参数直接定帧（上课复位 / 截图核对用）：
+     index.html?stage=5&view=2d&mode=anatomy&head=2&flow=0.6&play=0          */
+  const q = new URLSearchParams(location.search);
+  if (q.get('view') === '2d'){ S.view2d = true; S.viewT = 1; }
+  if (q.get('mode') === 'anatomy' || q.get('mode') === 'anat'){ S.mode = 'anatomy'; CAM.az = 0.115; CAM.el = 0.105; }
+  if (q.has('head')) S.head = Math.max(0, Math.min(NHEAD_DRAW-1, parseInt(q.get('head'),10) || 0));
+  if (q.has('layer')){ S.layer = Math.max(0, Math.min(11, parseInt(q.get('layer'),10) || 0)); S.layerLock = true; }
+  /* ?q=2 ：解剖视图里锁定第 3 个词当查询位置（-1 = 全部行） */
+  if (q.has('q')) S.qIdx = Math.max(-1, Math.min(S.tokens.length-1, parseInt(q.get('q'),10)));
+  if (q.has('stage')){
+    const si = Math.max(0, Math.min(STAGES.length-1, parseInt(q.get('stage'),10) || 0));
+    setStage(si);
+    if (q.has('flow')) S.t = STAGES[si].dur * Math.max(0, Math.min(0.99, parseFloat(q.get('flow')) || 0));
+  }
+  if (q.get('play') === '1') S.playing = true;
+  if (q.get('open')){ const ov = document.getElementById(q.get('open')); if (ov) ov.classList.add('on'); }
+  if (q.has('speed')) S.speed = Math.max(0.2, Math.min(4, parseFloat(q.get('speed')) || 1));
+  /* step=N：打开时直接往后走 N 步（深链/自检用，等价于点 N 次「下一步」） */
+  if (q.has('step')){
+    const nStep = Math.max(0, Math.min(40, parseInt(q.get('step'),10) || 0));
+    for (let i = 0; i < nStep; i++) advance(1);
+    snapView();
+  }
+  if (q.has('zoom')) CAM.zoom = Math.max(0.45, Math.min(2.2, parseFloat(q.get('zoom')) || 1));
+  /* 带 stage 参数打开（上课复位 / 截图核对）：把所有过渡直接推到目标值 */
+  if (q.has('stage')) snapView();
+  else if (STAGES[S.stage].sub) S.expandW = 1;
+  syncHeads(); syncSide(); syncStageList(); syncDock();
+  /* 调试用：把当前状态写进隐藏节点（自检 / 截图核对时读它） */
+  LIVE_NODE = document.createElement('pre');
+  LIVE_NODE.id = 'live'; LIVE_NODE.style.display = 'none';
+  document.body.appendChild(LIVE_NODE);
+  requestAnimationFrame(frame);
+
+  /* 自检信息：写进隐藏节点，方便无头浏览器/自动化核对 */
+  const diag = document.createElement('pre');
+  diag.id = 'diag'; diag.style.display = 'none';
+  const a0 = attention(0, 0, PROMPT_TOKENS);
+  diag.textContent = JSON.stringify({
+    stages: STAGES.map(s => s.id),
+    blocks: NBLOCK, realLayers: REAL_LAYERS, heads: NHEAD, headsDrawn: NHEAD_DRAW, dk: DK, dmodel: DMODEL, dff: DFF,
+    tokens: PROMPT_TOKENS,
+    mode: S.mode, realData: true, layer: S.layer, head: S.head, gates: N_GATE, gateGap: STG.gateGap, gateOfStage: GATE_OF_STAGE, gateNow: stGateNow(),
+    beadPos: S.tokens.map((t, i) => [+stX(i).toFixed(2), +stZ(0).toFixed(2), +stR(i, 0).toFixed(2)]),
+    attn_rowsums: a0.w.map(r => +r.reduce((x,y)=>x+y,0).toFixed(6)),
+    attn_l1_h1: a0.w.map(r => r.map(v => +v.toFixed(3))),
+    masked_upper_zero: a0.w.every((r,i) => r.every((v,j) => j <= i || v === 0)),
+    probs_top: probDist().list.slice(0,3),
+    webgl2: !!gl,
+    renderer: (function(){ try { const e = gl.getExtension('WEBGL_debug_renderer_info'); return e ? gl.getParameter(e.UNMASKED_RENDERER_WEBGL) : 'n/a'; } catch(e){ return 'n/a'; } })()
+  });
+  document.body.appendChild(diag);
+  /* ---------- 自检：?test=1 时用真实点击把两套视图、2D、查询词、换头都走一遍 ---------- */
+  if (q.get('test') === '1'){
+    const log = [];
+    const snap = tag => log.push({
+      tag: tag, mode: S.mode, view2d: S.view2d, stage: S.stage, qIdx: S.qIdx, head: S.head,
+      shownLabels: LBL.filter(o => o.el.style.opacity && o.el.style.opacity !== '0').length,
+      canon: +document.getElementById('stepNo').textContent.slice(0,2),
+      anatTop: anatTop()
+    });
+    snap('init');
+    document.getElementById('btnModeAnat').click();  snap('anat');
+    document.getElementById('btn2d').click();        snap('2d');
+    document.getElementById('btnNext').click();      snap('next');
+    const qb = qTabsEl.querySelectorAll('button');
+    if (qb[2]) qb[2].click();                        snap('qchip');
+    const htb = headTabs.querySelectorAll('button');
+    if (htb[2]) htb[2].click();                      snap('head3');
+    document.getElementById('btnModeBox').click();   snap('box');
+    document.getElementById('btnPrev').click();      snap('prev');
+    document.getElementById('btnModeAnat').click();  snap('anat2d-box?');
+    const tn = document.createElement('pre');
+    tn.id = 'test'; tn.style.display = 'none';
+    tn.textContent = JSON.stringify(log);
+    document.body.appendChild(tn);
+  }
+
+  window.__ready = true;
+}
+
+window.addEventListener('error', ev => fatal('脚本出错：' + ev.message + '\n' + (ev.filename||'') + ':' + (ev.lineno||'')));
+try { boot(); } catch (e){ fatal('初始化失败：\n' + (e && e.stack || e)); }
+</script>
+</body>
+</html>
