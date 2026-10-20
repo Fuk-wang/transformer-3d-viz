@@ -1,0 +1,2368 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPT 与 Transformer 架构可视化 · 敦煌双视图</title>
+<!--
+  ===========================================================================
+  GPT 与 Transformer 架构可视化 —— 单文件教学页（敦煌双视图 v3）
+  ---------------------------------------------------------------------------
+  这一版把两套呈现放在同一个页面里，右上/底部一键切换：
+
+    ① 结构框图（tower）  网络模块塔 + 张量方块一格一格往上搬
+    ② 向量解剖（anatomy）每个 token 一颗发光的词球，注意力用弧线相连，
+                         残差流是一根根竖梁，一层层往上长
+
+  皮肤沿用“敦煌 v1”：近黑底 + 石青 / 石绿 / 金线 / 朱砂 + 宋体，
+  两套视图共用一套配色、一套 12 步叙事、一套真算的注意力数值。
+
+  怎么读这份代码（面向自学）：
+    §1  <style>      界面样式（敦煌配色 / 面板 / 表格 / 公式排版）
+    §2  DOM          画布 + 3D 投影文字层 + 阶段表 + 讲解面板 + 控制条 + 浮层
+    §3  数据与数学     词表、确定性随机数、掩码 softmax（公式是真算的）
+    §4  WebGL 渲染器   盒体 / 细梁 / 网格 / 球体 / 弧形光带
+    §5  解剖视图       词球、残差竖梁、注意力弧、藻井地纹
+    §6  场景与动画     两种视图的分派、张量搬家状态机、相机、交互
+
+  想改哪里：搜「★」。
+  ===========================================================================
+-->
+<style>
+/* ============================ 1. 基础与配色（敦煌） ============================ */
+:root{
+  --void:#08060e;
+  --lapis:#16224a;          /* 石青（青金） */
+  --lapis-lt:#5b86d6;       /* 亮石青：数据 / 链接 / 数字 */
+  --lapis-pale:#a8c4f0;
+  --gold:#d9b56a;           /* 金线 */
+  --gold-lt:#f4e2b4;
+  --cin:#c8402f;            /* 朱砂：强调 / 掩码 */
+  --cin-lt:#e7765c;
+  --mal:#2f9e86;            /* 石绿：新生成的 token */
+  --mal-lt:#67d3b6;
+  --ink:#efe4cb;            /* 纸色文字 */
+  --dim:rgba(239,228,203,.58);
+  --faint:rgba(239,228,203,.3);
+  --hair:rgba(217,181,106,.24);
+  --hair-2:rgba(217,181,106,.5);
+  --panel:linear-gradient(180deg,rgba(24,20,34,.9),rgba(10,8,16,.93));
+  --panel-2:linear-gradient(180deg,rgba(28,23,38,.96),rgba(10,8,16,.97));
+  --serif:"Songti SC","Source Han Serif SC","Noto Serif CJK SC","STSong",SimSun,"Times New Roman",serif;
+  --mono:"Cascadia Mono",Consolas,"Courier New",monospace;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;margin:0;overflow:hidden}
+body{
+  background:
+    radial-gradient(1150px 700px at 50% -12%, #1b2547 0%, #101433 42%, #08060e 78%),
+    radial-gradient(760px 560px at 96% 106%, rgba(200,64,47,.13), transparent 70%),
+    radial-gradient(620px 460px at 4% 92%, rgba(47,158,134,.09), transparent 72%),
+    #08060e;
+  color:var(--ink);font-family:var(--serif);font-size:13px;
+  -webkit-font-smoothing:antialiased;
+}
+canvas#gl{position:fixed;inset:0;width:100%;height:100%;display:block;cursor:grab}
+canvas#gl.dragging{cursor:grabbing}
+/* 3D 里投影出来的文字：DOM 叠在画布上，中文永远清晰 */
+#labels{position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:2}
+.lbl{position:absolute;left:0;top:0;white-space:nowrap;transform-origin:50% 50%;
+     will-change:transform,opacity;transition:opacity .16s linear;
+     text-shadow:0 1px 4px #000,0 0 12px rgba(0,0,0,.95)}
+.lbl-mod{font-size:12.5px;letter-spacing:.06em;color:rgba(239,228,203,.86)}
+.lbl-mod.on{color:#1a1206;background:linear-gradient(180deg,var(--gold-lt),var(--gold));
+  padding:1px 7px;border-radius:1px;font-weight:700}
+.lbl-shape{font-family:var(--mono);font-size:10.5px;color:rgba(168,196,240,.82);
+  background:rgba(8,6,14,.72);padding:0 4px;border-radius:1px;border:1px solid rgba(91,134,214,.26)}
+.lbl-tok{font-size:12.5px;color:var(--ink);background:rgba(8,6,14,.6);
+  padding:1px 6px;border-radius:1px;border:1px solid var(--hair)}
+.lbl-tok.gen{border-color:rgba(103,211,182,.55);color:#c9ffe9}
+.lbl-tiny{font-family:var(--mono);font-size:10px;color:rgba(239,228,203,.5)}
+.lbl-note{font-size:11px;letter-spacing:.14em;color:rgba(217,181,106,.88)}
+.lbl-layer{font-size:11.5px;letter-spacing:.2em;color:rgba(244,226,180,.78)}
+.lbl-sphere{font-size:13px;color:var(--ink);background:rgba(8,6,14,.62);
+  padding:1px 7px;border:1px solid var(--hair)}
+.lbl-sphere.q{color:#1a1206;background:linear-gradient(180deg,var(--gold-lt),var(--gold));
+  border-color:var(--gold-lt)}
+.lbl-gate{font-size:11px;letter-spacing:.10em;color:rgba(244,226,180,.80);
+  background:rgba(8,6,14,.5);padding:0 5px;border-left:2px solid rgba(217,181,106,.55)}
+.lbl-head{font-family:var(--mono);font-size:10px;color:rgba(168,196,240,.72);letter-spacing:.06em}
+
+/* ============================ 2. 顶部标题 ============================ */
+#hud{position:fixed;left:22px;top:16px;z-index:6;pointer-events:none}
+#hud h1{margin:0;font-size:19px;font-weight:400;letter-spacing:.06em;
+  background:linear-gradient(92deg,#f7eed8 0%,#f0dcae 46%,#d9b56a 100%);
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+#hud h1 b{font-weight:400}
+#hud h1 em{font-style:normal;-webkit-text-fill-color:var(--cin-lt);color:var(--cin-lt)}
+#hud p{margin:6px 0 0;font-size:11.5px;color:var(--dim);letter-spacing:.09em}
+#hud .tag{display:inline-block;margin-right:7px;padding:1px 6px;border:1px solid var(--hair);
+  border-radius:1px;font-family:var(--mono);font-size:10px;color:var(--gold-lt)}
+
+/* ============================ 3. 左侧阶段表 ============================ */
+#stageList{position:fixed;left:22px;top:92px;z-index:6;width:184px;
+  background:var(--panel);border:1px solid var(--hair);border-radius:1px;
+  padding:9px 6px 8px;backdrop-filter:blur(8px);max-height:calc(100vh - 226px);overflow:auto;
+  box-shadow:0 24px 60px -34px #000}
+#stageList::after{content:'';position:absolute;inset:3px;border:1px solid rgba(217,181,106,.1);
+  pointer-events:none}
+#stageList .hd{font-size:9.5px;letter-spacing:.34em;color:var(--faint);
+  padding:2px 8px 8px;font-family:var(--mono)}
+#stageList button{display:block;width:100%;text-align:left;background:none;border:0;
+  color:var(--dim);font:inherit;font-size:11.5px;padding:5px 8px 5px 9px;cursor:pointer;
+  border-left:2px solid transparent;line-height:1.4}
+#stageList button:hover{color:var(--ink);background:rgba(217,181,106,.06)}
+#stageList button .n{font-family:var(--mono);font-size:9.5px;color:var(--faint);margin-right:6px}
+#stageList button.on{color:var(--gold-lt);background:rgba(200,64,47,.13);border-left-color:var(--cin)}
+#stageList button.on .n{color:var(--cin-lt)}
+
+/* ============================ 4. 右侧讲解面板 ============================ */
+#side{position:fixed;right:20px;top:16px;bottom:104px;width:330px;z-index:6;
+  display:flex;flex-direction:column;gap:10px;overflow:auto;padding-right:2px;
+  scrollbar-width:thin;scrollbar-color:rgba(217,181,106,.4) transparent}
+#side::-webkit-scrollbar{width:6px}
+#side::-webkit-scrollbar-thumb{background:rgba(217,181,106,.35)}
+.card{position:relative;background:var(--panel);border:1px solid var(--hair);
+  padding:12px 14px;backdrop-filter:blur(8px);box-shadow:0 24px 60px -34px #000}
+.card::before{content:'';position:absolute;inset:3px;border:1px solid rgba(217,181,106,.09);
+  pointer-events:none}
+.card::after{content:'';position:absolute;inset:-1px;pointer-events:none;opacity:.8;background:
+  linear-gradient(var(--gold),var(--gold)) 0 0/13px 1px no-repeat,
+  linear-gradient(var(--gold),var(--gold)) 0 0/1px 13px no-repeat,
+  linear-gradient(var(--gold),var(--gold)) 100% 100%/13px 1px no-repeat,
+  linear-gradient(var(--gold),var(--gold)) 100% 100%/1px 13px no-repeat}
+.card h2{margin:0 0 8px;font-size:13px;font-weight:400;letter-spacing:.06em;
+  display:flex;align-items:center;gap:7px;color:var(--gold-lt)}
+.card h2 .badge{font-family:var(--mono);font-size:9.5px;color:var(--cin-lt);
+  border:1px solid rgba(200,64,47,.5);border-radius:1px;padding:0 4px;letter-spacing:.1em}
+.card p{margin:0 0 8px;font-size:12px;line-height:1.8;color:rgba(239,228,203,.82);letter-spacing:.01em}
+.card p:last-child{margin-bottom:0}
+.card p b{color:var(--gold-lt);font-weight:400}
+.card .k{color:var(--lapis-pale);font-family:var(--mono);font-size:11px}
+.card .warn{color:var(--cin-lt)}
+.card .ok{color:var(--mal-lt)}
+
+/* 形状流水线 */
+.shapes{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:2px 0 9px}
+.shapes .s{font-family:var(--mono);font-size:10.5px;color:var(--lapis-pale);
+  background:rgba(22,34,74,.55);border:1px solid rgba(91,134,214,.32);
+  padding:2px 6px;border-radius:1px}
+.shapes .ar{color:var(--faint);font-size:10px}
+.shapes .op{font-size:10.5px;color:var(--gold);font-family:var(--mono)}
+
+/* 公式（纯 HTML 排版，不引外部库） */
+.eq{margin:9px 0 4px;padding:11px 12px;background:rgba(217,181,106,.05);
+  border-left:2px solid var(--gold);font-family:"Cambria Math",Georgia,var(--serif);
+  font-size:15px;color:#f7eed8;overflow-x:auto}
+.eq .frac{display:inline-block;vertical-align:middle;text-align:center;margin:0 3px}
+.eq .frac .up{display:block;padding:0 4px 1px;border-bottom:1px solid rgba(217,181,106,.5)}
+.eq .frac .dn{display:block;padding:1px 4px 0}
+.eq sub,.eq sup{font-size:10px}
+.eq .mask{color:var(--cin-lt)}
+.eq-cap{font-size:10.5px;color:var(--faint);margin:0 0 6px;line-height:1.7}
+
+/* 注意力数值表 */
+table.attn{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:10px;margin-top:4px}
+table.attn th,table.attn td{padding:2px 1px;text-align:center;border:1px solid rgba(217,181,106,.12)}
+table.attn th{color:var(--faint);font-weight:400;font-size:9.5px}
+table.attn td.msk{color:rgba(231,118,92,.42);background:rgba(200,64,47,.07)}
+table.attn td.hot{background:rgba(217,181,106,.18);color:var(--gold-lt)}
+.legend{display:flex;gap:10px;font-size:10px;color:var(--faint);margin-top:7px;flex-wrap:wrap}
+.legend i{display:inline-block;width:8px;height:8px;border-radius:1px;margin-right:4px;vertical-align:middle}
+.headTabs,.qTabs{display:flex;gap:4px;margin:8px 0 2px;flex-wrap:wrap}
+.headTabs button,.qTabs button{flex:1 1 auto;min-width:34px;background:rgba(22,34,74,.5);
+  border:1px solid var(--hair);color:var(--dim);font:inherit;font-size:10.5px;
+  font-family:var(--mono);padding:3px 4px;cursor:pointer}
+.headTabs button.on,.qTabs button.on{background:rgba(217,181,106,.16);
+  border-color:var(--gold);color:var(--gold-lt)}
+
+/* 下一个词的概率条 */
+#probs{display:none}
+#probs.on{display:block}
+.prow{display:flex;align-items:center;gap:7px;margin:4px 0;font-size:11.5px}
+.prow .w{width:52px;text-align:right;color:var(--dim);font-family:var(--mono);font-size:11px}
+.prow .bar{flex:1;height:9px;background:rgba(91,134,214,.14);overflow:hidden}
+.prow .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,rgba(91,134,214,.7),var(--lapis-pale));
+  transition:width .45s cubic-bezier(.3,.9,.3,1)}
+.prow.top{color:var(--ink)}
+.prow.top .w{color:var(--gold-lt)}
+.prow.top .bar i{background:linear-gradient(90deg,rgba(217,181,106,.75),var(--gold-lt))}
+.prow .v{width:38px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--faint)}
+
+/* 底部公式条 */
+#eqBar{position:fixed;left:50%;transform:translateX(-50%);bottom:78px;z-index:6;
+  width:min(760px,calc(100vw - 420px));display:none;align-items:center;gap:18px;
+  padding:10px 18px;background:linear-gradient(180deg,rgba(26,21,36,.9),rgba(9,7,15,.94));
+  border:1px solid var(--hair);backdrop-filter:blur(8px)}
+#eqBar.on{display:flex}
+#eqBar::before{content:'';position:absolute;inset:3px;border:1px solid rgba(217,181,106,.10);pointer-events:none}
+#eqBar .cap{font-family:var(--mono);font-size:9px;letter-spacing:.26em;color:var(--faint);flex:0 0 auto}
+#eqBar .f{flex:1;text-align:center;font-family:"Cambria Math",Georgia,var(--serif);
+  font-size:20px;color:#f7eed8;white-space:nowrap}
+#eqBar .f .fr{display:inline-block;vertical-align:middle;text-align:center;margin:0 4px}
+#eqBar .f .fr .up{display:block;padding:0 5px 1px;border-bottom:1px solid rgba(217,181,106,.55)}
+#eqBar .f .fr .dn{display:block;padding:1px 5px 0}
+#eqBar .f .br{font-size:26px;color:var(--gold)}
+#eqBar .f .mk{color:var(--cin-lt)}
+#eqBar .f sub,#eqBar .f sup{font-size:11px}
+#eqBar .lh{font-family:var(--mono);font-size:10px;color:var(--gold-lt);letter-spacing:.1em;flex:0 0 auto}
+@media (max-width:1240px){#eqBar{display:none!important}}
+
+/* ============================ 5. 底部控制条 ============================ */
+#dock{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;z-index:7;
+  display:flex;align-items:center;gap:7px;padding:9px 12px;
+  background:var(--panel-2);border:1px solid var(--hair-2);
+  backdrop-filter:blur(10px);box-shadow:0 10px 40px rgba(0,0,0,.6)}
+#dock::before{content:'';position:absolute;inset:2px;border:1px solid rgba(217,181,106,.12);pointer-events:none}
+#dock button{background:rgba(217,181,106,.05);border:1px solid var(--hair);color:var(--ink);
+  font:inherit;font-size:11.5px;padding:5px 9px;cursor:pointer;
+  display:flex;align-items:center;gap:5px;white-space:nowrap;transition:background .16s,color .16s}
+#dock button:hover{background:rgba(217,181,106,.14);border-color:var(--hair-2)}
+#dock button.on{background:rgba(217,181,106,.2);border-color:var(--gold);color:var(--gold-lt)}
+#dock button.primary{background:linear-gradient(180deg,var(--gold-lt),var(--gold));
+  border-color:var(--gold-lt);color:#1a1206;min-width:74px;justify-content:center;font-weight:700}
+#dock button.primary:hover{filter:brightness(1.06)}
+#dock .sep{width:1px;height:22px;background:var(--hair)}
+#dock label{font-size:10.5px;color:var(--faint);display:flex;align-items:center;gap:5px}
+#dock input[type=range]{width:66px;accent-color:var(--gold)}
+#prog{width:132px;height:3px;background:rgba(217,181,106,.16);overflow:hidden}
+#prog i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--gold),var(--cin-lt))}
+#stepNo{font-family:var(--mono);font-size:10.5px;color:var(--dim);min-width:44px;text-align:center}
+/* 视图切换：两个一组的分段按钮 */
+.seg2{display:flex;border:1px solid var(--hair)}
+.seg2 button{border:0!important;background:transparent;padding:5px 10px!important}
+.seg2 button+button{border-left:1px solid var(--hair)!important}
+.seg2 button.on{background:linear-gradient(180deg,var(--gold-lt),var(--gold))!important;color:#1a1206!important}
+
+/* ============================ 6. 浮层（说明 / 架构总览） ============================ */
+.overlay{position:fixed;inset:0;z-index:20;display:none;background:rgba(4,3,8,.84);
+  backdrop-filter:blur(6px);overflow:auto;padding:44px 20px}
+.overlay.on{display:block}
+.sheet{max-width:920px;margin:0 auto;background:var(--panel-2);border:1px solid var(--hair-2);
+  padding:26px 30px;position:relative}
+.sheet::before{content:'';position:absolute;inset:5px;border:1px solid rgba(217,181,106,.14);pointer-events:none}
+.sheet h2{margin:0 0 4px;font-size:18px;font-weight:400;letter-spacing:.06em;color:var(--gold-lt)}
+.sheet .sub{color:var(--dim);font-size:12px;margin:0 0 18px}
+.sheet h3{margin:22px 0 8px;font-size:13px;color:var(--gold);letter-spacing:.1em;font-weight:400}
+.sheet p,.sheet li{font-size:12.5px;line-height:1.85;color:rgba(239,228,203,.84)}
+.sheet li{margin:4px 0}
+.sheet b{color:var(--gold-lt);font-weight:400}
+.sheet .close{position:sticky;top:0;float:right;background:rgba(217,181,106,.1);
+  border:1px solid var(--hair-2);color:var(--ink);font:inherit;font-size:12px;
+  padding:4px 10px;cursor:pointer}
+.arch{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin:12px 0 4px}
+.arch .col{border:1px solid var(--hair);padding:14px}
+.arch .col h4{margin:0 0 10px;font-size:12px;color:var(--gold-lt);font-weight:400;letter-spacing:.06em}
+.arch .stack{display:flex;flex-direction:column;gap:5px}
+.arch .blk{border:1px solid rgba(91,134,214,.3);padding:6px 9px;
+  font-size:11px;color:rgba(239,228,203,.82);background:rgba(22,34,74,.4)}
+.arch .blk.hi{border-color:rgba(217,181,106,.5);background:rgba(217,181,106,.09);color:var(--gold-lt)}
+.arch .blk.rep{color:var(--faint);text-align:center;font-family:var(--mono);font-size:10px;
+  border-style:dashed}
+.arch .note{font-size:11px;color:var(--dim);margin-top:9px;line-height:1.7}
+kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--hair-2);
+  border-bottom-width:2px;border-radius:1px;padding:1px 4px;color:var(--ink);background:rgba(217,181,106,.08)}
+
+/* 右下角图例 */
+#legendBox,#legendAnat{position:fixed;right:20px;bottom:18px;z-index:5;font-size:10px;color:var(--faint);
+  display:flex;gap:12px;align-items:center;pointer-events:none;flex-wrap:wrap;
+  max-width:330px;justify-content:flex-end}
+#legendAnat{display:none}
+#legendBox span,#legendAnat span{display:flex;align-items:center;gap:4px}
+#legendBox i,#legendAnat i{width:9px;height:9px;border-radius:1px;display:inline-block}
+
+/* 错误遮罩 */
+#fatal{position:fixed;inset:0;z-index:99;display:none;background:#0b0810;color:#ffc0b2;
+  font-family:var(--mono);font-size:12px;padding:40px;white-space:pre-wrap;line-height:1.7}
+#fatal.on{display:block}
+
+/* 窄屏 */
+@media (max-width:1240px){
+  #stageList{width:160px}
+  #side{width:300px}
+}
+@media (max-width:980px){
+  #stageList{display:none}
+  #side{display:none}
+  #legendBox,#legendAnat{display:none}
+  #hud h1{font-size:16px}
+  #dock{gap:5px;padding:7px 8px}
+  #dock button{font-size:10.5px;padding:4px 7px}
+  #prog{width:70px}
+}
+</style>
+</head>
+<body>
+<!-- 3D 画布 -->
+<canvas id="gl"></canvas>
+<!-- 3D 投影文字层（DOM 叠加，中文不糊） -->
+<div id="labels"></div>
+
+<!-- 顶部标题 -->
+<header id="hud">
+  <h1>GPT 与 <b>Transformer</b> 架构可视化</h1>
+  <p><span class="tag">Decoder ×12</span><span class="tag">head ×4</span><span class="tag">d=768</span>
+     结构框图 + 向量解剖 · 掩码自注意力 · 自回归预测下一个词</p>
+</header>
+
+<!-- 左：阶段表（由 JS 按 STAGES 生成） -->
+<nav id="stageList"><div class="hd">LEARNING PATH</div></nav>
+
+<!-- 右：讲解面板 -->
+<aside id="side">
+  <section class="card">
+    <h2><span class="badge" id="stBadge">STEP 01</span><span id="stTitle">输入序列</span></h2>
+    <div class="shapes" id="stShapes"></div>
+    <p id="stText">—</p>
+  </section>
+
+  <section class="card" id="modeCard">
+    <h2>现在看的是哪种图</h2>
+    <p id="modeText">—</p>
+    <div class="qTabs" style="margin-top:9px">
+      <button id="modeBtnBox" class="on">① 结构框图</button>
+      <button id="modeBtnAnat">② 词珠长廊</button>
+    </div>
+  </section>
+
+  <section class="card" id="mhaCard" style="display:none">
+    <h2>掩码多头自注意力 <span class="badge">真算的</span></h2>
+    <div class="eq">
+      <i>H</i><sub>i</sub> = softmax<span style="font-size:19px">(</span>
+      <span class="frac"><span class="up"><i>Q</i><sub>i</sub><i>K</i><sub>i</sub><sup>T</sup></span><span class="dn">√<i>d</i><sub>k</sub></span></span>
+      <span class="mask">+ <i>M</i></span><span style="font-size:19px">)</span><i>V</i><sub>i</sub>
+    </div>
+    <div class="eq-cap">分母 √d<sub>k</sub> 把点积压回合理量级；<span class="mask">M 是因果掩码</span>：
+      第 i 行只能看第 1…i 列，右侧一律 −∞（softmax 后变 0），所以叫「掩码」自注意力。</div>
+    <div class="headTabs" id="headTabs"></div>
+    <p style="font-size:11px;color:var(--faint);margin:6px 0 0">四个头看的东西不一样：切换 H1–H4，
+      右侧表格、框图里的发光网格、解剖视图里的弧线会一起变。</p>
+    <div id="attnTbl"></div>
+    <div class="legend">
+      <span><i style="background:rgba(200,64,47,.6)"></i>被掩码 = 0</span>
+      <span><i style="background:rgba(217,181,106,.9)"></i>权重高</span>
+      <span><i style="background:rgba(91,134,214,.45)"></i>权重低</span>
+    </div>
+    <p style="margin-top:9px">每行加起来 <span class="k">= 1</span>。四个头各有一张表，
+      分别盯「前一个词 / 句首 / 自己 / 语义相近」—— 这就是<b>多头</b>的意义。</p>
+  </section>
+
+  <section class="card" id="mlpCard" style="display:none">
+    <h2>MLP 前馈网络 <span class="badge">768→3072→768</span></h2>
+    <div class="shapes">
+      <span class="s">6×768</span><span class="ar">×W₁→</span>
+      <span class="s">6×3072</span><span class="ar">GELU→</span>
+      <span class="s">6×3072</span><span class="ar">×W₂→</span>
+      <span class="s">6×768</span>
+    </div>
+    <p>注意力负责<b>让 token 之间交换信息</b>；MLP 负责<b>让每个 token 自己想清楚</b>。
+      它逐位置作用、不跨 token，先把维度撑大 4 倍（能表达更复杂的组合），过 GELU 非线性，
+      再压回 768。每层两个权重矩阵：<span class="k">768×3072</span> 与 <span class="k">3072×768</span>，
+      约 <b>4.7 M</b> 参数 —— 约占一个 GPT-2 层参数的 2/3。</p>
+  </section>
+
+  <section class="card" id="probsCard" style="display:none">
+    <h2>下一 token 概率 <span class="badge">softmax(logits)</span></h2>
+    <p style="margin-bottom:6px">最后一个位置的向量乘上词表矩阵（<span class="k">50257×768</span>）得到 logits，
+      再 softmax 成概率。取概率最大的那个，就是这一步「吐出来」的词。</p>
+    <div id="probsList"></div>
+    <p style="margin-top:8px;font-size:11px;color:var(--faint)">
+      注意：这里显示的是<b>整段推理最后一层</b>的输出，不是中间层。</p>
+  </section>
+
+  <section class="card" id="anatCard" style="display:none">
+    <h2>长廊怎么读 <span class="badge">弧 = 注意力</span></h2>
+    <p>画面是一条<b>门廊</b>：一道门 = 一层（① 嵌入 → ②③④⑤ 四块 Decoder → ⑥ 输出/logits），门一道套一道往深处退，
+      走一步就多开一道门。<br>
+      每颗<b>发光珠</b>是一个 token 在该层的向量（不是文字，是 768 个数），珠子串在柱子上就是<b>残差流</b>；
+      门里那几条拱起来的<b>弧</b>是注意力，线越粗越亮，说明这一层越在看那个词；每块里柱子还会分叉成 4 条<b>头轨</b>，
+      对应 4 个注意力头。</p>
+    <div class="qTabs" id="qTabs"></div>
+    <p style="font-size:11px;color:var(--faint);margin-top:6px">点上面的词，可以换一个「查询位置」：
+      看它在各层分别把注意力投给了谁。默认是最后那个词（它才需要回答「下一个词是什么」）。</p>
+  </section>
+
+  <section class="card" id="stackCard" style="display:none">
+    <h2>Decoder 堆叠 <span class="badge">×12</span></h2>
+    <p>GPT-2 small 一共 <b>12 个 Decoder 块</b>首尾相接，每块的输出直接喂给下一块，
+      形状始终是 <span class="k">6×768</span> —— 深层不会改变形状，改的是<b>每个向量的含义</b>。
+      画面上只画 4 块，中间用「⋮ ×12」省略，动画会把整摞跑一遍。</p>
+  </section>
+</aside>
+
+<!-- 底部公式条（v1 的招牌：一条大公式压在画面下沿） -->
+<div id="eqBar">
+  <span class="cap">SCALED DOT-PRODUCT ATTENTION</span>
+  <span class="f"><i>H</i><sub>i</sub> = softmax<span class="br">(</span><span class="fr"><span class="up"><i>Q</i><sub>i</sub><i>K</i><sub>i</sub><sup>T</sup></span><span class="dn">√<i>d</i><sub>k</sub></span></span><span class="mk">+ <i>M</i></span><span class="br">)</span><i>V</i><sub>i</sub></span>
+  <span class="lh" id="eqLH">L1 · H1</span>
+</div>
+
+<!-- 底部控制条 -->
+<div id="dock">
+  <button id="btnPrev" title="上一步（←）">◀ 上一步</button>
+  <button id="btnPlay" class="primary" title="播放 / 暂停（空格）">▶ 播放</button>
+  <button id="btnNext" title="下一步（→）">下一步 ▶</button>
+  <div class="sep"></div>
+  <div id="prog"><i id="progFill"></i></div>
+  <div id="stepNo">01/12</div>
+  <div class="sep"></div>
+  <div class="seg2" id="segMode">
+    <button id="btnModeBox" class="on" title="模块框图（快捷键 M）">框图</button>
+    <button id="btnModeAnat" title="词珠长廊（快捷键 M）">长廊</button>
+  </div>
+  <button id="btn2d" title="2D / 3D 视图（快捷键 2）">2D 视图</button>
+  <button id="btnFollow" class="on" title="跟随当前模块（快捷键 F）">跟随</button>
+  <label>速度 <input id="speed" type="range" min="0.3" max="2.2" step="0.1" value="1"></label>
+  <button id="btnReset" title="重来（R）">重来</button>
+  <div class="sep"></div>
+  <button id="btnArch" title="Transformer 与 GPT 的关系">架构总览</button>
+  <button id="btnHelp" title="怎么读这个页面">说明</button>
+</div>
+
+<!-- 右下角图例：两套，跟视图一起换 -->
+<div id="legendBox">
+  <span><i style="background:rgba(91,134,214,.6)"></i>模块</span>
+  <span><i style="background:#d9b56a"></i>正在计算</span>
+  <span><i style="background:#5b86d6"></i>张量数据</span>
+  <span><i style="background:#2f9e86"></i>新生成的 token</span>
+  <span><i style="background:rgba(200,64,47,.8)"></i>被掩码</span>
+</div>
+<div id="legendAnat">
+  <span><i style="background:#d9b56a;border-radius:50%"></i>名词 / 术语</span>
+  <span><i style="background:#5b86d6;border-radius:50%"></i>虚词 / 动词</span>
+  <span><i style="background:#2f9e86;border-radius:50%"></i>标点 / 数量 / 新词</span>
+  <span><i style="background:rgba(217,181,106,.35)"></i>弧越亮 = 权重越大</span>
+</div>
+
+<!-- 浮层：架构总览（讲清 Encoder/Decoder 与 GPT 的关系） -->
+<div class="overlay" id="arch">
+  <div class="sheet">
+    <button class="close" data-close="arch">关闭 ✕</button>
+    <h2>Transformer 与 GPT：到底是什么关系</h2>
+    <p class="sub">一句话：<b>Transformer 是 2017 年那篇论文给出的整体架构；GPT 是其中「只用 Decoder 那一半」的堆叠。</b></p>
+
+    <div class="arch">
+      <div class="col">
+        <h4>① Transformer 原版（Encoder–Decoder）</h4>
+        <div class="stack">
+          <div class="blk">输入嵌入 + 位置编码</div>
+          <div class="blk hi">Encoder 块 ×N<br><span style="font-size:10px;color:var(--dim)">自注意力（双向，不掩码）+ FFN</span></div>
+          <div class="blk rep">↕ 编码器输出（每个位置的上下文向量）</div>
+          <div class="blk hi">Decoder 块 ×N<br><span style="font-size:10px;color:var(--dim)">掩码自注意力 + <b>交叉注意力</b> + FFN</span></div>
+          <div class="blk">线性层 + softmax → 输出词分布</div>
+        </div>
+        <div class="note">两部分都在：Encoder 先把整句读进去（双向看），Decoder 一边看已生成的词、
+          一边回头查 Encoder 的输出。典型任务是<b>翻译</b>：输入一整句，输出另一整句。</div>
+      </div>
+      <div class="col">
+        <h4>② GPT（Decoder-only）</h4>
+        <div class="stack">
+          <div class="blk">token 嵌入 + 位置编码</div>
+          <div class="blk hi">Decoder 块 ×N<br><span style="font-size:10px;color:var(--dim)">掩码自注意力 + 残差/LayerNorm + FFN</span></div>
+          <div class="blk rep">… 重复 N 次（GPT-2 small：N = 12）…</div>
+          <div class="blk hi">最后一层 LayerNorm</div>
+          <div class="blk">线性层（→ logits）+ softmax → 下一个词</div>
+        </div>
+        <div class="note">没有 Encoder、没有交叉注意力：<b>只有 Decoder，砍掉一半</b>。
+          因为只做「预测下一个词」，输入和输出本来就是同一串文本，不需要两个网络。
+          于是它天生<b>自回归</b>：预测出 1 个词 → 接到句尾 → 整句再跑一遍 → 再预测。</div>
+      </div>
+    </div>
+
+    <h3>对照表</h3>
+    <ul>
+      <li><b>Encoder</b>：双向自注意力（每个词能看到左右两边），没有掩码。<b>GPT 里没有。</b></li>
+      <li><b>Decoder</b>：掩码自注意力（每个词只能看到自己和左边），这是自回归的关键 —— 保证训练时不会「偷看答案」。</li>
+      <li><b>交叉注意力</b>：Decoder 去查 Encoder 的输出。<b>GPT 里没有</b>（没有另一个序列可查）。</li>
+      <li><b>GPT = Decoder 块堆叠 + 词表投影</b>，参数几乎全在 Decoder 块里（每层约 7 M，12 层约 85 M，加上嵌入共 124 M）。</li>
+      <li><b>自回归语言模型</b>：P(下一个词 | 前面所有词)。生成 = 反复调用自己，每次只产出一个 token。</li>
+    </ul>
+
+    <h3>这个页面演的是哪一半</h3>
+    <p>就是上表<b>右边那一整摞</b>：token → 嵌入 → Decoder×12（每层：LayerNorm → 掩码多头自注意力 →
+      残差 → LayerNorm → MLP → 残差）→ 最终 LayerNorm → logits → softmax → 下一个词 → 接回输入。
+      点画面上的「下一步」，就是沿这条链路走一格。</p>
+  </div>
+</div>
+
+<!-- 浮层：使用说明 -->
+<div class="overlay" id="help">
+  <div class="sheet">
+    <button class="close" data-close="help">关闭 ✕</button>
+    <h2>怎么读这个页面</h2>
+    <p class="sub">给第一次打开的人：3 分钟上手。两种视图讲的是同一件事，换着看最省力。</p>
+
+    <h3>两套视图（底部「框图 / 解剖」切换）</h3>
+    <ul>
+      <li><b>① 结构框图</b>：网络像一摞抽屉。数据是一个<b>张量方块</b>，一格一格往上搬，到哪个模块哪个模块亮。
+        适合看清「顺序」：嵌入 → Decoder×4（⋮×12）→ 最终 LayerNorm → logits。</li>
+      <li><b>② 向量解剖</b>：把同一个过程的内脏摊开。每颗<b>发光球</b>是一个 token 的向量，
+        竖着的金线是<b>残差流</b>，层与层之间的<b>弧线</b>是注意力（越粗越亮 = 权重越大），
+        弧线围成的扇形就是「谁在看谁」。适合看清「token 之间怎么交换信息」。</li>
+      <li>两套视图共用同一套 <b>12 步</b>叙事和同一批真算的注意力数值，所以任何时候按「上一步/下一步」都是同一步。</li>
+    </ul>
+
+    <h3>画面上的东西是什么</h3>
+    <ul>
+      <li><b>方块</b> = 张量（一批数字）。底下一排是 <b>token</b>，每个 token 会变成一条 768 维向量。</li>
+      <li><b>大盒子</b> = 网络模块；<b>琥珀色发光</b> = 数据此刻正在这里被计算，右侧面板同时写出它在算哪个矩阵。</li>
+      <li><b>青金石蓝的小方块</b> = 正在搬运的那个张量。它一格一格跳，没有粒子拖尾 —— 这样能看清数据走到哪。</li>
+      <li>当前这块 Decoder 会被<b>拉开</b>，露出 LayerNorm → 掩码注意力 → Add&amp;Norm → MLP → Add&amp;Norm 五个子模块和两条残差旁路。</li>
+      <li>解剖视图里，球按词性分色：<b>金色</b>=名词/术语，<b>石青</b>=虚词/动词，<b>石绿</b>=标点/数字/新生成的词。</li>
+    </ul>
+
+    <h3>操作</h3>
+    <ul>
+      <li><b>下一步 / 上一步</b>：一格一格看，最推荐。想停就停。</li>
+      <li><b>播放</b>：自动跑完整条链路，包括最后「生成一个词再从头再来」的自回归循环。</li>
+      <li><b>2D 视图</b>：切成正面正交投影，变成平面示意图，看结构更清楚；<b>3D</b> 能看到残差旁路绕在侧面的纵深。</li>
+      <li><b>跟随</b>：开着时相机自动对准当前模块；关掉就可以用鼠标自由拖着看。</li>
+      <li>鼠标拖动 = 转视角，滚轮 = 缩放。解剖视图里点右侧的<b>查询词</b>可以换「谁在看别人」。</li>
+    </ul>
+
+    <h3>快捷键</h3>
+    <ul>
+      <li><kbd>空格</kbd> 播放/暂停 · <kbd>←</kbd> <kbd>→</kbd> 上/下一步</li>
+      <li><kbd>1</kbd> 3D 视图 · <kbd>2</kbd> 2D 视图 · <kbd>M</kbd> 切换框图 / 解剖</li>
+      <li><kbd>F</kbd> 跟随开/关 · <kbd>R</kbd> 重来 · <kbd>H</kbd> 帮助</li>
+      <li><kbd>Q</kbd> <kbd>E</kbd> 切换注意力头（1–4）</li>
+    </ul>
+
+    <h3>建议的阅读顺序</h3>
+    <p>先点「架构总览」看 Transformer 和 GPT 的关系（Encoder / Decoder 各是什么），
+      再回到画面从 STEP 01 点「下一步」走到 STEP 12；走到「掩码多头自注意力」那一步时切成<b>解剖视图</b>，
+      看看同一个头到底把注意力投给了谁；最后按「播放」看一遍自回归循环。
+      走完一遍，你应该能回答：为什么 GPT 只需要 Decoder？掩码到底挡住了什么？残差和 LayerNorm 各解决什么问题？</p>
+  </div>
+</div>
+
+<!-- 脚本出错时的兜底 -->
+<div id="fatal"></div>
+
+<script>
+'use strict';
+/* =====================================================================
+   §3  数据与数学
+   ---------------------------------------------------------------------
+   这个页面里所有数字都是当场算出来的，不是画上去的装饰：
+     · Q/K 由确定性随机数生成（同一个种子，刷新页面结果一样）
+     · 注意力 = 掩码 softmax(Q·Kᵀ/√d_k + M)，M 把「未来」的列压成 -∞
+     · 概率条 = softmax(logits)，logits 由固定种子生成，保证演示稳定可复现
+   ===================================================================== */
+
+/* ★ 模型规格：想演示更大的模型，改这里（画面上只画前 4 块） */
+const NTOK_PROMPT = 5;      // 提示词 token 数
+const NBLOCK      = 4;      // ★ 画面上画几个实体 Decoder 块
+const REAL_LAYERS = 12;     // ★ 真实层数（用于「×12」标签与参数统计）
+const NHEAD       = 4;      // ★ 每个块里的注意力头数
+const DK          = 64;     // 每个头的维度
+const DMODEL      = 768;    // 模型维度（残差流的宽度）
+const DFF         = 3072;   // MLP 中间层维度 = 4×768
+const VOCAB       = 50257;  // 词表大小（GPT-2）
+
+/* ★ 演示用的提示词 + 自回归要吐出来的词。改成别的句子就是另一个例子。 */
+const PROMPT_TOKENS = ['GPT', '是', '一种', '语言', '模型'];
+/* 每一步「预测下一个词」的分布由这里决定：第 1 个是模型选中的词，后面是陪跑的候选。
+   p 是它给出的概率，其余候选的概率写在 d 里 —— 合起来 < 1，剩下的概率归给「词表里其他 5 万个词」。 */
+const GEN_PLAN = [
+  { w:'，',        p:0.42, d:[['。',0.21],['它',0.18],['是',0.13],['的',0.08]] },
+  { w:'它',        p:0.38, d:[['这个',0.16],['GPT',0.14],['模型',0.11],['我们',0.07]] },
+  { w:'由',        p:0.44, d:[['是',0.22],['用',0.15],['基于',0.12],['把',0.06]] },
+  { w:'12',        p:0.36, d:[['多层',0.19],['四个',0.14],['若干',0.11],['一个',0.07]] },
+  { w:'层',        p:0.47, d:[['个',0.24],['组',0.12],['块',0.10],['次',0.05]] },
+  { w:'Decoder',   p:0.40, d:[['编码器',0.18],['注意力',0.15],['Transformer',0.10],['层',0.06]] },
+  { w:'堆叠',      p:0.41, d:[['组成',0.20],['构成',0.16],['重复',0.12],['相连',0.07]] },
+  { w:'而成',      p:0.39, d:[['构成',0.17],['组成',0.14],['的',0.12],['。',0.09]] }
+];
+const MAX_TOKENS = 8;       // 生成到 8 个 token 就重置演示，避免画面挤爆
+
+/* ---------- 确定性随机数（同一个种子 → 每次打开完全一样） ---------- */
+function mulberry32(seed){
+  let a = seed >>> 0;
+  return function(){
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+/* 两个数揉成一个种子，保证 (层,头,行,列) 每个组合的噪声都不同又固定 */
+function seedOf(a, b, c, d){
+  return (Math.imul(a + 1, 2654435761) ^ Math.imul(b + 1, 40503) ^
+          Math.imul(c + 1, 2246822519) ^ Math.imul(d + 1, 3266489917)) >>> 0;
+}
+
+/* ---------- 语义分组：只影响「语义头」偏向哪些词 ---------- */
+function groupOf(tok){
+  if (['GPT','语言','模型','Decoder','Transformer','注意力','编码器'].indexOf(tok) >= 0) return 1; // 术语/名词
+  if (['是','由','用','基于','把','和','的','一种'].indexOf(tok) >= 0) return 2;                 // 虚词
+  if (['，','。','12','层','个','堆叠','而成','构成','组成'].indexOf(tok) >= 0) return 3;         // 标点/数量
+  return 0;
+}
+
+/* ---------- 四种「问法」：这就是 4 个头各自不同的偏好 ---------- */
+const HEAD_SPEC = [
+  { name:'局部头', desc:'只看紧邻的前一个词，负责语法接续', bias:(i,j)=> (i===j? 0.9 : (i-j===1? 1.5 : -0.35*(i-j))) },
+  { name:'句首头', desc:'把注意力压回序列开头，当作全局锚点',  bias:(i,j)=> (j===0? (i>2? 2.1 : 1.1) : -0.45) },
+  { name:'自身头', desc:'主要看自己，负责把本位置信息带下去',    bias:(i,j)=> (i===j? 2.0 : -0.55) },
+  { name:'语义头', desc:'连线给同一类词，负责跨距离语义关联',    bias:(i,j,toks)=> (groupOf(toks[i])===groupOf(toks[j]) && i!==j ? 1.5 : (i===j? 0.7 : -0.25)) }
+];
+
+/* ---------- 掩码 softmax：公式 H_i = softmax(Q_iK_iᵀ/√d_k + M)V_i 里 softmax 那一半 ---------- */
+const ATTN_CACHE = new Map();
+/* 返回 {w: 权重矩阵, masked: 布尔矩阵, raw: 未 softmax 的分数} */
+function attention(layer, head, toks){
+  const key = layer + '|' + head + '|' + toks.join('\u0001');
+  if (ATTN_CACHE.has(key)) return ATTN_CACHE.get(key);
+  const n = toks.length, spec = HEAD_SPEC[head], raw = [], masked = [], w = [];
+  for (let i = 0; i < n; i++){
+    raw.push(new Array(n).fill(0));
+    masked.push(new Array(n).fill(false));
+    w.push(new Array(n).fill(0));
+    for (let j = 0; j < n; j++){
+      /* Q·Kᵀ/√d_k：用一个确定性随机数冒充真实点积（形状和量级一致，值固定可复现） */
+      const rnd = mulberry32(seedOf(layer, head, i, j))();
+      let s = (rnd - 0.5) * 2.0 * (1 + layer * 0.12);   // 噪声：越深的层越分散一点
+      s += spec.bias(i, j, toks);
+      s += (i === j ? 0.5 : 0);                          // 自己跟自己总有点关联
+      raw[i][j] = s;
+      if (j > i){ masked[i][j] = true; raw[i][j] = -Infinity; }  // ← 因果掩码 M
+    }
+    /* softmax（减最大值防溢出；被掩码的项 exp(-∞)=0） */
+    let mx = -Infinity;
+    for (let j = 0; j < n; j++) if (!masked[i][j]) mx = Math.max(mx, raw[i][j]);
+    let sum = 0;
+    for (let j = 0; j < n; j++){
+      if (masked[i][j]) { w[i][j] = 0; continue; }
+      const e = Math.exp(raw[i][j] - mx); w[i][j] = e; sum += e;
+    }
+    for (let j = 0; j < n; j++) w[i][j] = masked[i][j] ? 0 : w[i][j] / sum;
+  }
+  const out = { w, masked, raw };
+  ATTN_CACHE.set(key, out);
+  return out;
+}
+
+/* 每个头「最关注谁」—— 右侧面板里那句话用 */
+function headPeak(info, toks){
+  const n = toks.length; let sum = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) sum[j] += info.w[i][j];
+  let k = 0; for (let j = 1; j < n; j++) if (sum[j] > sum[k]) k = j;
+  return { idx:k, tok:toks[k], share: sum.reduce((a,b)=>a+b,0) ? sum[k] / sum.reduce((a,b)=>a+b,0) : 0 };
+}
+
+/* ---------- 下一个词的概率分布 ---------- */
+function probDist(genIdx){
+  const g = GEN_PLAN[genIdx % GEN_PLAN.length];
+  const list = [{ w:g.w, p:g.p }].concat(g.d.map(x => ({ w:x[0], p:x[1] })));
+  list.sort((a,b) => b.p - a.p);
+  const rest = Math.max(0, 1 - list.reduce((s,x)=>s+x.p,0));
+  return { list, rest };
+}
+
+/* =====================================================================
+   §3.1  阶段脚本：整条推理链路切成 12 步
+   ---------------------------------------------------------------------
+   每一步定义：标题、讲解、形状变化、哪个模块高亮（active）、以及相机看哪
+   ===================================================================== */
+const STAGES = [
+  { id:'tokens', name:'输入序列', badge:'STEP 01', title:'输入序列：先把句子切成 token',
+    active:'tokens', focus:'tokens', dur:3.4,
+    shapes:'[5]  token id 序列  文字:"GPT 是一种语言模型"',
+    text:'先把提示词切成 token（这里 5 个）。它们现在是<b>一串整数 id</b>，还没有任何「含义」。' +
+         'GPT 的全部工作，就是把这串整数一层层算成「下一个词最可能是什么」。' +
+         '<br><br>注意画面上的每一条 token 都是一个<b>张量方块</b> —— 后面它会长成一条 768 维向量。' },
+
+  { id:'embed', name:'Token 嵌入 + 位置编码', badge:'STEP 02', title:'查表变成向量，再加上「位置」',
+    active:'embed', focus:'embed', dur:4.2,
+    shapes:'[5] 整数 → 查表 50257×768 → + 位置编码 → [5×768]',
+    text:'每个 id 去查一张 <b>50257×768</b> 的嵌入表，取出一行 768 维向量；' +
+         '再加上<b>位置编码</b>，让模型知道谁在前、谁在后（自注意力本身对顺序无感）。' +
+         '<br><br>于是得到一张 <b>5×768</b> 的矩阵。记住它的形状：' +
+         '整个 Decoder 堆叠<u>一路都保持这个形状</u>，变的只是里面的数值。' },
+
+  { id:'stack', name:'进入 Decoder 堆叠', badge:'STEP 03', title:'12 个 Decoder 块，首尾相接',
+    active:'b0', focus:'stack', dur:4.0,
+    shapes:'[5×768] → Decoder ×12（画 4 块）→ [5×768]',
+    text:'这一摞盒子才是 GPT 的真身：<b>12 个结构完全相同的 Decoder 块</b>，' +
+         '前一块的输出直接喂给后一块。画面上画 4 块，中间用「⋮ ×12」省略。' +
+         '<br><br>为什么只要 Decoder？因为 GPT 只做一件事：<b>预测下一个词</b>。' +
+         '输入和输出本来就是同一串文本，不需要 Encoder 去读另一个序列（点「架构总览」看对照）。' },
+
+  { id:'ln1', name:'① LayerNorm', badge:'STEP 04', title:'块内第一件事：LayerNorm',
+    active:'b0', sub:'ln1', focus:'b0', dur:3.6,
+    shapes:'[5×768] → LayerNorm → [5×768]',
+    text:'把块拉开看。第一件事是 <b>LayerNorm</b>：对<b>每个位置</b>的 768 个数分别减均值、除标准差，' +
+         '再乘 γ 加 β。它<b>不混合 token</b>，只把每个向量自己的数值拉回稳定范围。' +
+         '<br><br>为什么需要它？深网络里数值会越乘越大或越乘越小，归一化让 12 层叠起来仍然好训练。' },
+
+  { id:'mha', name:'② 掩码多头自注意力', badge:'STEP 05', title:'核心：掩码多头自注意力',
+    active:'b0', sub:'mha', focus:'b0', dur:9.0, mha:true,
+    shapes:'[5×768] → Q,K,V（4 头，每头 64 维）→ 4×[5×64] → QKᵀ/√d_k + M → softmax → 4×[5×5] → ×V → 拼接 → W_O → [5×768]',
+    text:'这是唯一让 <b>token 之间交换信息</b> 的地方。每个位置算出 Query / Key / Value 三组向量，' +
+         '共 4 个头、每头 64 维。<br><br>' +
+         '<b>分数</b>：Q·Kᵀ/√d_k 得到一张 5×5 的「谁该看谁」表；' +
+         '<span class="warn">因果掩码 M 把右上角（未来）压成 −∞</span>，softmax 后变 0 —— ' +
+         '所以第 i 个位置只能看 1…i，这就是「不能偷看答案」。<br><br>' +
+         '画面里那张发光网格就是它：<b>行的和恒为 1</b>，右下三角永远空着。' +
+         '四个头看的东西不一样，右侧可以逐个切换。' },
+
+  { id:'add1', name:'③ 残差 + LayerNorm', badge:'STEP 06', title:'残差连接：把原样也带过去',
+    active:'b0', sub:'add1', focus:'b0', dur:3.8,
+    shapes:'注意力输出 [5×768] + 块输入 [5×768] → LayerNorm → [5×768]',
+    text:'注意力的输出不会直接往下走，而是<b>先加上「进入注意力之前的那份张量」</b>：' +
+         '这就是<b>残差连接</b>（画面左侧那条绕过模块的旁路）。<br><br>' +
+         '它给了梯度一条高速公路：12 层、96 层叠上去也不会梯度消失；' +
+         '同时让每层只学「增量」，不用重学整个表示。加完再做一次 LayerNorm。' },
+
+  { id:'mlp', name:'④ MLP 前馈网络', badge:'STEP 07', title:'MLP：让每个 token 自己想清楚',
+    active:'b0', sub:'mlp', focus:'b0', dur:6.0, mlp:true,
+    shapes:'[5×768] → ×W₁ → [5×3072] → GELU → ×W₂ → [5×768]',
+    text:'注意力负责「横向」交流，MLP 负责「纵向」加工：它<b>逐位置</b>作用，token 之间互不相干。' +
+         '<br><br>先把 768 维撑到 <b>3072 维</b>（4 倍宽，给非线性留出组合空间），过 <b>GELU</b>，' +
+         '再压回 768。两个矩阵共约 <b>4.7 M</b> 参数 —— 一个 GPT-2 层里 2/3 的参数都在这里。' },
+
+  { id:'add2', name:'⑤ 残差 + 输出', badge:'STEP 08', title:'第二处残差：一块 Decoder 结束',
+    active:'b0', sub:'add2', focus:'b0', dur:3.6,
+    shapes:'MLP 输出 [5×768] + 上一处输出 → LayerNorm → [5×768] → 下一块',
+    text:'MLP 的输出同样加上残差、再过 LayerNorm，这一块的活儿就干完了。' +
+         '<br><br>一块 Decoder 的全部内容就是：<b>LN → 掩码多头注意力 → 残差+LN → MLP → 残差+LN</b>。' +
+         '12 块只是把这个盒子重复 12 次，形状永远是 5×768。' },
+
+  { id:'pass', name:'传递到第 2–12 层', badge:'STEP 09', title:'同样的盒子，重复 12 次',
+    active:'b1', focus:'stack', dur:5.0,
+    shapes:'[5×768] → 块 2 → 块 3 → ⋯ → 块 12 → [5×768]',
+    text:'后面 11 块结构和第 1 块<b>一模一样</b>，参数各不相同。数据一块块往上搬：' +
+         '每条 768 维向量被反复改写，逐渐从「词的表面」变成「能用来预测下一个词的状态」。' +
+         '<br><br>经验上：浅层偏语法/局部搭配，中层偏语义角色，深层才压向「该输出哪个词」。' },
+
+  { id:'final', name:'最终 LayerNorm', badge:'STEP 10', title:'最后一层 LayerNorm',
+    active:'finalLN', focus:'finalLN', dur:3.2,
+    shapes:'[5×768] → 最终 LayerNorm → [5×768]（只取最后一个位置）',
+    text:'12 块走完，做最后一次 LayerNorm，把数值收进稳定范围。' +
+         '<br><br>然后只取<b>最后一个位置</b>的 768 维向量 —— 因为它是唯一「看过整句」的位置，' +
+         '也只有它需要回答「下一个词是什么」。' },
+
+  { id:'logits', name:'Logits → Softmax', badge:'STEP 11', title:'从 768 维到 5 万个词的概率',
+    active:'logits', focus:'logits', dur:6.2, probs:true,
+    shapes:'[768] → ×词表矩阵 50257×768 → [50257] logits → softmax → 概率',
+    text:'把最后那个 768 维向量乘上<b>词表矩阵（50257×768）</b>，得到 50257 个分数（logits）；' +
+         'softmax 把它们变成概率，加起来等于 1。' +
+         '<br><br>右下角那排条就是这张分布：<b>抽一个（或取最大的）</b>，这个 token 就是模型的输出。' +
+         '<br><br>注意：这里没有任何「理解」在发生，只是向量乘法 + 归一化。' },
+
+  { id:'loop', name:'自回归：接回去再来一遍', badge:'STEP 12', title:'自回归：把新词接回句尾，从头再跑',
+    active:'tokens', focus:'tokens', dur:7.0, probs:true, loop:true,
+    shapes:'"…语言模型" + "，" → 整句重跑一遍 → 再预测下一个词',
+    text:'把刚生成的「，」<b>接到序列末尾</b>，整句重新送进网络，再预测下一个词 —— ' +
+         '这就是<b>自回归</b>（autoregressive）：一次只吐一个 token，然后自己吃自己的输出。' +
+         '<br><br>绿色方块是模型自己生成的。注意每多一个 token，注意力矩阵就从 5×5 长成 6×6、7×7……' +
+         '这就是为什么真实推理很贵：句子越长，每一步都要重算（工程上用 KV Cache 省掉重复计算）。' }
+];
+/* =====================================================================
+   §4  渲染器（手写 WebGL2，零依赖）
+   ---------------------------------------------------------------------
+   思路：整个 3D 场景就是一堆「盒子」。每一帧在 CPU 侧把几何重新拼进两个
+   Float32Array（不透明 / 半透明），然后各一次 drawArrays 画完 —— 简单、可控，
+   几万个顶点对现代显卡毫无压力。
+
+   为什么不用粒子/拖尾效果：这个页面的目的是让人看清「数据此刻在哪个模块」，
+   于是张量被画成**一个整体方块**，一格一格地跳；发光用的是模块本身和网格，
+   而不是满屏飞散的点。这是任务要求里明确点名的一条。
+   ===================================================================== */
+
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl2', { antialias:true, alpha:true, premultipliedAlpha:false, powerPreference:'high-performance' });
+
+function fatal(msg){
+  const el = document.getElementById('fatal');
+  el.textContent = msg;
+  el.classList.add('on');
+}
+if (!gl){ fatal('这个浏览器没能创建 WebGL2 上下文。\n请用较新的 Chrome / Edge / Firefox 打开本页。'); }
+
+/* ---------- 着色器：一盏主光 + 一盏补光 + 边缘光；glow=1 的顶点完全自发光 ---------- */
+const VS = `#version 300 es
+in vec3 a_pos;
+in vec3 a_nrm;
+in vec4 a_col;
+in float a_glow;
+uniform mat4 u_vp;
+out vec3 v_nrm; out vec4 v_col; out float v_glow; out vec3 v_pos;
+void main(){
+  v_pos = a_pos; v_nrm = a_nrm; v_col = a_col; v_glow = a_glow;
+  gl_Position = u_vp * vec4(a_pos, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec3 v_nrm; in vec4 v_col; in float v_glow; in vec3 v_pos;
+uniform vec3 u_eye;
+out vec4 o_col;
+void main(){
+  vec3 N = normalize(v_nrm);
+  vec3 L1 = normalize(vec3(0.42, 0.88, 0.62));
+  vec3 L2 = normalize(vec3(-0.65, 0.20, 0.72));
+  float lit = 0.42 + 0.70 * max(dot(N, L1), 0.0) + 0.24 * max(dot(N, L2), 0.0);
+  vec3 V = normalize(u_eye - v_pos);
+  vec3 H = normalize(L1 + V);
+  float spec = pow(max(dot(N, H), 0.0), 26.0) * 0.42;
+  float rim = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 2.6);
+  vec3 col = v_col.rgb * lit + v_col.rgb * rim * (0.45 + v_glow * 1.8) + vec3(spec) * (1.0 - v_glow * 0.6);
+  col = mix(col, v_col.rgb, clamp(v_glow, 0.0, 1.0));
+  o_col = vec4(col, v_col.a);
+}`;
+
+let prog = null, uVP = null, uEye = null, aPos = 0, aNrm = 0, aCol = 0, aGlow = 0;
+function initGL(){
+  function sh(type, src){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error('着色器编译失败:\n' + gl.getShaderInfoLog(s));
+    return s;
+  }
+  prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error('着色器链接失败:\n' + gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  aPos  = gl.getAttribLocation(prog, 'a_pos');
+  aNrm  = gl.getAttribLocation(prog, 'a_nrm');
+  aCol  = gl.getAttribLocation(prog, 'a_col');
+  aGlow = gl.getAttribLocation(prog, 'a_glow');
+  uVP   = gl.getUniformLocation(prog, 'u_vp');
+  uEye  = gl.getUniformLocation(prog, 'u_eye');
+
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthFunc(gl.LEQUAL);
+  gl.disable(gl.CULL_FACE);                 // 盒子很薄，关掉背面剔除省心
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+}
+
+/* ---------- 几何缓冲：11 floats 一个顶点 ---------- */
+const STRIDE = 11 * 4;
+function mkBuf(cap){ return { a:new Float32Array(cap * 11), n:0, vao:gl.createVertexArray(), vbo:gl.createBuffer(), lastBytes:0 }; }
+const BUF_OPAQUE = mkBuf(16000);   // 不透明：模块、张量、连线
+const BUF_GLASS  = mkBuf(4000);    // 半透明：幽灵框、外框、高亮罩
+
+function growBuf(b){
+  if (b.n + 400 * 11 < b.a.length) return;
+  const nb = new Float32Array(b.a.length * 2); nb.set(b.a); b.a = nb;
+}
+function vtx(b, x,y,z, nx,ny,nz, c, glow){
+  growBuf(b);
+  const a = b.a; let i = b.n;
+  a[i++] = x; a[i++] = y; a[i++] = z;
+  a[i++] = nx; a[i++] = ny; a[i++] = nz;
+  a[i++] = c[0]; a[i++] = c[1]; a[i++] = c[2]; a[i++] = c[3];
+  a[i++] = glow;
+  b.n = i;
+}
+function tri(b, p0, p1, p2, c, glow){
+  const ux = p1[0]-p0[0], uy = p1[1]-p0[1], uz = p1[2]-p0[2];
+  const vx = p2[0]-p0[0], vy = p2[1]-p0[1], vz = p2[2]-p0[2];
+  let nx = uy*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy*vx;
+  const L = Math.hypot(nx, ny, nz) || 1; nx/=L; ny/=L; nz/=L;
+  vtx(b, p0[0],p0[1],p0[2], nx,ny,nz, c, glow);
+  vtx(b, p1[0],p1[1],p1[2], nx,ny,nz, c, glow);
+  vtx(b, p2[0],p2[1],p2[2], nx,ny,nz, c, glow);
+}
+function quad(b, p0, p1, p2, p3, c, glow){
+  tri(b, p0, p1, p2, c, glow);
+  tri(b, p0, p2, p3, c, glow);
+}
+
+/* 轴对齐盒体。六个面用不同的明暗系数，让「方」的感觉出来（比纯色块立体得多）。 */
+const FACE = {
+  top:    { n:[0, 1, 0], k:1.16 },
+  bottom: { n:[0,-1, 0], k:0.52 },
+  right:  { n:[1, 0, 0], k:0.90 },
+  left:   { n:[-1,0, 0], k:0.78 },
+  front:  { n:[0, 0, 1], k:1.00 },
+  back:   { n:[0, 0,-1], k:0.66 }
+};
+function shadeC(c, k, alphaScale){
+  const a = c[3] * (alphaScale === undefined ? 1 : alphaScale);
+  return [c[0]*k, c[1]*k, c[2]*k, a];
+}
+function box(b, cx,cy,cz, sx,sy,sz, c, glow, alphaScale){
+  const x0=cx-sx/2, x1=cx+sx/2, y0=cy-sy/2, y1=cy+sy/2, z0=cz-sz/2, z1=cz+sz/2;
+  const g = glow || 0, as = alphaScale;
+  // front (+z)
+  quad(b, [x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1], shadeC(c,FACE.front.k,as), g);
+  // back (-z)
+  quad(b, [x1,y0,z0],[x0,y0,z0],[x0,y1,z0],[x1,y1,z0], shadeC(c,FACE.back.k,as), g);
+  // right (+x)
+  quad(b, [x1,y0,z1],[x1,y0,z0],[x1,y1,z0],[x1,y1,z1], shadeC(c,FACE.right.k,as), g);
+  // left (-x)
+  quad(b, [x0,y0,z0],[x0,y0,z1],[x0,y1,z1],[x0,y1,z0], shadeC(c,FACE.left.k,as), g);
+  // top (+y)
+  quad(b, [x0,y1,z1],[x1,y1,z1],[x1,y1,z0],[x0,y1,z0], shadeC(c,FACE.top.k,as), g);
+  // bottom (-y)
+  quad(b, [x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1], shadeC(c,FACE.bottom.k,as), g);
+}
+
+/* 细梁：轴对齐的细长盒子。用来画连线、残差旁路、块的外框。 */
+function beam(b, x0,y0,z0, x1,y1,z1, t, c, glow){
+  const cx=(x0+x1)/2, cy=(y0+y1)/2, cz=(z0+z1)/2;
+  const sx=Math.max(t, Math.abs(x1-x0)), sy=Math.max(t, Math.abs(y1-y0)), sz=Math.max(t, Math.abs(z1-z0));
+  box(b, cx,cy,cz, sx,sy,sz, c, glow);
+}
+
+/* 线框盒：只画 12 条棱（块被「拉开」时用它，让内部看得见） */
+function wireBox(b, cx,cy,cz, sx,sy,sz, t, c, glow){
+  const x0=cx-sx/2, x1=cx+sx/2, y0=cy-sy/2, y1=cy+sy/2, z0=cz-sz/2, z1=cz+sz/2;
+  beam(b,x0,y0,z0, x1,y0,z0, t,c,glow); beam(b,x0,y1,z0, x1,y1,z0, t,c,glow);
+  beam(b,x0,y0,z1, x1,y0,z1, t,c,glow); beam(b,x0,y1,z1, x1,y1,z1, t,c,glow);
+  beam(b,x0,y0,z0, x0,y1,z0, t,c,glow); beam(b,x1,y0,z0, x1,y1,z0, t,c,glow);
+  beam(b,x0,y0,z1, x0,y1,z1, t,c,glow); beam(b,x1,y0,z1, x1,y1,z1, t,c,glow);
+  beam(b,x0,y0,z0, x0,y0,z1, t,c,glow); beam(b,x1,y0,z0, x1,y0,z1, t,c,glow);
+  beam(b,x0,y1,z0, x0,y1,z1, t,c,glow); beam(b,x1,y1,z0, x1,y1,z1, t,c,glow);
+}
+
+/* 正面朝 +z 的网格面板：注意力矩阵、MLP 条、概率条都用它 */
+function gridPanel(b, cx, cy, cz, cell, gap, rows, cols, cellFn){
+  const w = cols*cell + (cols-1)*gap, h = rows*cell + (rows-1)*gap;
+  const x0 = cx - w/2, y1 = cy + h/2;
+  for (let r = 0; r < rows; r++){
+    for (let c = 0; c < cols; c++){
+      const x = x0 + c*(cell+gap), y = y1 - r*(cell+gap) - cell;
+      const st = cellFn(r, c);
+      if (!st) continue;
+      quad(b, [x,y,cz],[x+cell,y,cz],[x+cell,y+cell,cz],[x,y+cell,cz], st.c, st.g || 0);
+    }
+  }
+}
+
+/* ---------- 矩阵工具（4x4，列主序，和 WebGL 一致） ---------- */
+function m4(){ return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]); }
+function m4mul(out, a, b){
+  for (let c = 0; c < 4; c++){
+    for (let r = 0; r < 4; r++){
+      out[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    }
+  }
+  return out;
+}
+function m4persp(out, fovy, aspect, near, far){
+  const f = 1 / Math.tan(fovy/2), nf = 1/(near-far);
+  out[0]=f/aspect; out[1]=0; out[2]=0; out[3]=0;
+  out[4]=0; out[5]=f; out[6]=0; out[7]=0;
+  out[8]=0; out[9]=0; out[10]=(far+near)*nf; out[11]=-1;
+  out[12]=0; out[13]=0; out[14]=2*far*near*nf; out[15]=0;
+  return out;
+}
+function m4lookAt(out, eye, ctr, up){
+  let zx=eye[0]-ctr[0], zy=eye[1]-ctr[1], zz=eye[2]-ctr[2];
+  let L=Math.hypot(zx,zy,zz)||1; zx/=L; zy/=L; zz/=L;
+  let xx=up[1]*zz-up[2]*zy, xy=up[2]*zx-up[0]*zz, xz=up[0]*zy-up[1]*zx;
+  L=Math.hypot(xx,xy,xz)||1; xx/=L; xy/=L; xz/=L;
+  const yx=zy*xz-zz*xy, yy=zz*xx-zx*xz, yz=zx*xy-zy*xx;
+  out[0]=xx; out[1]=yx; out[2]=zx; out[3]=0;
+  out[4]=xy; out[5]=yy; out[6]=zy; out[7]=0;
+  out[8]=xz; out[9]=yz; out[10]=zz; out[11]=0;
+  out[12]=-(xx*eye[0]+xy*eye[1]+xz*eye[2]);
+  out[13]=-(yx*eye[0]+yy*eye[1]+yz*eye[2]);
+  out[14]=-(zx*eye[0]+zy*eye[1]+zz*eye[2]);
+  out[15]=1;
+  return out;
+}
+
+/* 把世界坐标投到屏幕像素（给 DOM 文字层用） */
+const PROJ = m4(), VIEW = m4(), VP = m4();
+function project(p){
+  const x = VP[0]*p[0] + VP[4]*p[1] + VP[8]*p[2] + VP[12];
+  const y = VP[1]*p[0] + VP[5]*p[1] + VP[9]*p[2] + VP[13];
+  const w = VP[3]*p[0] + VP[7]*p[1] + VP[11]*p[2] + VP[15];
+  if (w <= 0.001) return null;
+  return { x:(x/w*0.5+0.5)*W, y:(1-(y/w*0.5+0.5))*H, w:w, depth:w };
+}
+
+/* ---------- 每帧上传并绘制 ---------- */
+function setupAttribs(b){
+  gl.bindVertexArray(b.vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, b.vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, b.a.subarray(0, b.n), gl.DYNAMIC_DRAW);
+  const S = STRIDE;
+  gl.enableVertexAttribArray(aPos);  gl.vertexAttribPointer(aPos,  3, gl.FLOAT, false, S, 0);
+  gl.enableVertexAttribArray(aNrm);  gl.vertexAttribPointer(aNrm,  3, gl.FLOAT, false, S, 12);
+  gl.enableVertexAttribArray(aCol);  gl.vertexAttribPointer(aCol,  4, gl.FLOAT, false, S, 24);
+  gl.enableVertexAttribArray(aGlow); gl.vertexAttribPointer(aGlow, 1, gl.FLOAT, false, S, 40);
+}
+function drawBuf(b){
+  if (!b.n) return;
+  setupAttribs(b);
+  gl.drawArrays(gl.TRIANGLES, 0, b.n/11);
+  gl.bindVertexArray(null);
+}
+
+/* 颜色工具 */
+function C(hex, a){
+  const r = parseInt(hex.slice(1,3),16)/255, g = parseInt(hex.slice(3,5),16)/255, b = parseInt(hex.slice(5,7),16)/255;
+  return [r, g, b, a === undefined ? 1 : a];
+}
+function mixC(c1, c2, t){
+  return [c1[0]+(c2[0]-c1[0])*t, c1[1]+(c2[1]-c1[1])*t, c1[2]+(c2[2]-c1[2])*t, c1[3]+(c2[3]-c1[3])*t];
+}
+function clamp01(v){ return v < 0 ? 0 : v > 1 ? 1 : v; }
+function ease(t){ return t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2, 3)/2; }
+function lerp(a,b,t){ return a + (b-a)*t; }
+/* =====================================================================
+   §4.2  解剖视图用的几何：球体 / 弧形光带 / 藻井地纹
+   ---------------------------------------------------------------------
+   仍然是「每帧重拼顶点」的老办法：
+     · sphere()      经纬球，给词球用
+     · ring3d()      一圈细线，给球的轮廓光环（非实心，省顶点）
+     · arcRibbon()   二次贝塞尔 + 面向相机的扁带 → 看起来是光滑的发光弧
+     · dunhuangFloor()  藻井地纹：几层套方 + 角上的短刻度
+   ===================================================================== */
+
+/* 相机的眼睛位置：每帧由 updateCamera() 写进来，弧线要朝向它才好看 */
+const EYE = [0, 0, 8];
+
+/* 经纬球：直接写进顶点缓冲，法线 = 单位球面法线 */
+function sphere(b, cx, cy, cz, r, c, glow, seg, ring){
+  seg = seg || 12; ring = ring || 7;
+  for (let i = 0; i < ring; i++){
+    const v0 = i / ring * Math.PI, v1 = (i + 1) / ring * Math.PI;
+    const y0 = Math.cos(v0), y1 = Math.cos(v1);
+    const r0 = Math.sin(v0), r1 = Math.sin(v1);
+    for (let j = 0; j < seg; j++){
+      const u0 = j / seg * Math.PI * 2, u1 = (j + 1) / seg * Math.PI * 2;
+      const p00 = [cx + r*r0*Math.cos(u0), cy + r*y0, cz + r*r0*Math.sin(u0)];
+      const p10 = [cx + r*r0*Math.cos(u1), cy + r*y0, cz + r*r0*Math.sin(u1)];
+      const p01 = [cx + r*r1*Math.cos(u0), cy + r*y1, cz + r*r1*Math.sin(u0)];
+      const p11 = [cx + r*r1*Math.cos(u1), cy + r*y1, cz + r*r1*Math.sin(u1)];
+      const n = p => { const d = [p[0]-cx, p[1]-cy, p[2]-cz]; const L = Math.hypot(d[0],d[1],d[2]) || 1; return [d[0]/L, d[1]/L, d[2]/L]; };
+      const nn = n(p00), nn2 = n(p11);
+      /* 两个三角形，法线用球面法线（顶点级插值，边缘不会发黑） */
+      vtx(b, p00[0],p00[1],p00[2], nn[0],nn[1],nn[2], c, glow);
+      vtx(b, p10[0],p10[1],p10[2], n(p10)[0],n(p10)[1],n(p10)[2], c, glow);
+      vtx(b, p01[0],p01[1],p01[2], n(p01)[0],n(p01)[1],n(p01)[2], c, glow);
+      vtx(b, p10[0],p10[1],p10[2], n(p10)[0],n(p10)[1],n(p10)[2], c, glow);
+      vtx(b, p11[0],p11[1],p11[2], nn2[0],nn2[1],nn2[2], c, glow);
+      vtx(b, p01[0],p01[1],p01[2], n(p01)[0],n(p01)[1],n(p01)[2], c, glow);
+    }
+  }
+}
+
+/* 水平圆环（球外的一圈细辉光）：用细梁拼，成本低 */
+function ring3d(b, cx, cy, cz, r, t, c, glow, seg){
+  seg = seg || 28;
+  for (let k = 0; k < seg; k++){
+    const a0 = k / seg * Math.PI * 2, a1 = (k + 1) / seg * Math.PI * 2;
+    const x0 = cx + r*Math.cos(a0), z0 = cz + r*Math.sin(a0);
+    const x1 = cx + r*Math.cos(a1), z1 = cz + r*Math.sin(a1);
+    beam(b, x0, cy, z0, x1, cy, z1, t, c, glow);
+  }
+}
+
+/* 二次贝塞尔取样 */
+function bez(p0, pc, p1, n){
+  const out = [];
+  for (let k = 0; k <= n; k++){
+    const t = k / n, it = 1 - t;
+    out.push([
+      it*it*p0[0] + 2*it*t*pc[0] + t*t*p1[0],
+      it*it*p0[1] + 2*it*t*pc[1] + t*t*p1[1],
+      it*it*p0[2] + 2*it*t*pc[2] + t*t*p1[2]
+    ]);
+  }
+  return out;
+}
+
+/* 面向相机的扁带：把一串点变成一条有宽度的光弧（法线朝相机 → 不受光照影响）
+   width 会沿弧线两端收窄，看起来像一笔毛笔线。 */
+function ribbon(b, pts, width, c, glow){
+  if (pts.length < 2 || width <= 0.0006) return;
+  for (let k = 0; k + 1 < pts.length; k++){
+    const p0 = pts[k], p1 = pts[k+1];
+    let tx = p1[0]-p0[0], ty = p1[1]-p0[1], tz = p1[2]-p0[2];
+    const tl = Math.hypot(tx,ty,tz) || 1; tx/=tl; ty/=tl; tz/=tl;
+    const mx = (p0[0]+p1[0])/2, my = (p0[1]+p1[1])/2, mz = (p0[2]+p1[2])/2;
+    let vx = mx-EYE[0], vy = my-EYE[1], vz = mz-EYE[2];
+    const vl = Math.hypot(vx,vy,vz) || 1; vx/=vl; vy/=vl; vz/=vl;
+    /* side = t × v（朝相机方向的垂线） */
+    let sx = ty*vz - tz*vy, sy = tz*vx - tx*vz, sz = tx*vy - ty*vx;
+    const sl = Math.hypot(sx,sy,sz) || 1; sx/=sl; sy/=sl; sz/=sl;
+    /* 两端收窄：第 k 段占全弧的位置 */
+    const u = (k + 0.5) / (pts.length - 1);
+    const taper = 0.48 + 0.52 * Math.pow(Math.sin(Math.PI * Math.min(1, Math.max(0, u))), 0.40);
+    const w = width * taper;
+    const a = [p0[0]+sx*w, p0[1]+sy*w, p0[2]+sz*w];
+    const bq= [p1[0]+sx*w, p1[1]+sy*w, p1[2]+sz*w];
+    const cq= [p1[0]-sx*w, p1[1]-sy*w, p1[2]-sz*w];
+    const d = [p0[0]-sx*w, p0[1]-sy*w, p0[2]-sz*w];
+    /* 法线朝相机，让着色器里的边缘光几乎不起作用 → 颜色稳定 */
+    const nn = [vx, vy, vz];
+    const put = p => vtx(b, p[0],p[1],p[2], nn[0],nn[1],nn[2], c, glow);
+    put(a); put(bq); put(cq);
+    put(a); put(cq); put(d);
+  }
+}
+
+/* 一条带拱高的注意力弧：从 a 到 b，控制点在中点上方 lift 处 */
+function arcBetween(b, a, bb, lift, width, c, glow, segs){
+  const mid = [(a[0]+bb[0])/2, (a[1]+bb[1])/2 + lift, (a[2]+bb[2])/2];
+  ribbon(b, bez(a, mid, bb, segs || 16), width, c, glow);
+}
+
+/* 竖直细线（残差流）：从 y0 到 y1，带一点渐隐（顶端用更淡的颜色） */
+function residualFlow(b, x, z, y0, y1, t, c, glow){
+  beam(b, x, y0, z, x, y1, z, t, c, glow);
+  /* 沿线的三个小节点，表示「每层都往上加一笔」 */
+  const n = 3;
+  for (let k = 0; k < n; k++){
+    const y = y0 + (y1 - y0) * (k + 0.5) / n;
+    box(b, x, y, z, t*2.6, 0.09, t*2.6, c, glow);
+  }
+}
+
+/* 藻井地纹：几层套方 + 四角短刻度 + 中轴十字，全部贴在地面上 */
+function dunhuangFloor(b, y, half, cMain, cTick, a){
+  const step = half / 4;
+  for (let k = 1; k <= 4; k++){
+    const s = step * k;
+    const w = (k === 4 ? 0.022 : 0.014);
+    const cc = k === 4 ? cMain : cTick;
+    beam(b, -s, y, -s,  s, y, -s, w, cc, 0);
+    beam(b, -s, y,  s,  s, y,  s, w, cc, 0);
+    beam(b, -s, y, -s, -s, y,  s, w, cc, 0);
+    beam(b,  s, y, -s,  s, y,  s, w, cc, 0);
+  }
+  /* 角上的短刻度（像画框的角花） */
+  for (let k = 0; k < 4; k++){
+    const sx = k < 2 ? -1 : 1, sz = (k % 2 === 0) ? -1 : 1;
+    for (let m = 1; m <= 3; m++){
+      const d = step * (3.05 + m * 0.22);
+      beam(b, sx*d, y, sz*half*0.42, sx*d, y, sz*(half*0.42 + 0.42), 0.012, cTick, 0);
+    }
+  }
+  /* 中轴十字 */
+  beam(b, -half, y, 0, half, y, 0, 0.012, cTick, 0);
+  beam(b, 0, y, -half, 0, y, half, 0.012, cTick, 0);
+}
+/* =====================================================================
+   §5  展廊视图（照第一版「门廊」的骨架重做）
+   ---------------------------------------------------------------------
+   结构（和 v1 一致，只是换成 GPT 的说法）：
+
+     z 轴 = 深度方向的一串「门」：① 嵌入 → ② 块1 → ③ 块2 → ④ 块3
+            → ⑤ 块4 → ⑥ 输出/logits。离观众最近的是嵌入门，越往里越深。
+     x 轴 = 词（每个词一根纵向的柱，珠子串在柱上）
+     y 轴 = 4 个注意力头：每块里每根柱分叉到 4 条头轨再收回来
+     珠子   = 某个词在某道门上的 768 维向量
+     弧带   = 这一块里「谁在看谁」，粗细/亮度 = 权重
+   门内那层暖光（玻璃面）就是 v1 的「展柜」感 —— 只在柜内发光，
+   柜外仍是深空星野，所以不会整屏糊成米黄。
+   ===================================================================== */
+
+/* ★ 展廊的尺寸：想调疏密就改这里 */
+const STG = {
+  gapX:    2.02,   // 词间距
+  gateGap: 3.95,   // 门与门的纵深距离
+  halfH:   2.90,   // 门框半高
+  rad:     1.15,   // 门框圆角
+  r0:      0.42,   // 珠子基础半径
+  floorY: -2.62    // 地面高度
+};
+const N_GATE = 6;
+/* 12 步 → 站到第几道门（0 嵌入 · 1..4 块 · 5 输出） */
+const GATE_OF_STAGE = [0, 0, 1, 1, 1, 1, 2, 2, 3, 4, 5, 5];
+const GATE_LABEL = ['① 嵌入', '② 块 1', '③ 块 2', '④ 块 3', '⑤ 块 4', '⑥ 输出'];
+const GATE_SUB   = ['EMBEDDING', '注意力 + MLP', '注意力 + MLP', '注意力 + MLP', '注意力 + MLP', 'LOGITS → SOFTMAX'];
+/* 4 个头的竖直位置：上二下二，和 v1 的「头轨」一样分叉 */
+const HYN = [1.18, 0.40, -0.40, -1.18];
+const HEAD_NAME = ['H1 前词头', 'H2 句首头', 'H3 自身头', 'H4 语义头'];
+
+const SC = {
+  gold:     C('#d9b56a', 1.0),
+  goldSoft: C('#d9b56a', 0.42),
+  goldFaint:C('#d9b56a', 0.15),
+  lapis:    C('#16224a', 0.96),
+  lapisLt:  C('#5b86d6', 1.0),
+  lapisSoft:C('#5b86d6', 0.32),
+  mal:      C('#2f9e86', 1.0),
+  cin:      C('#c8402f', 1.0),
+  cinSoft:  C('#c8402f', 0.42)
+};
+/* 四个头各自的颜色（v1 也是四个头四色） */
+const HEAD_COL = [C('#5b86d6', 0.9), C('#d9b56a', 0.9), C('#67d3b6', 0.9), C('#e7765c', 0.9)];
+const TOK_COL = { 0: '#d9b56a', 1: '#d9b56a', 2: '#5b86d6', 3: '#2f9e86' };
+
+/* 门在 z 轴上的位置：嵌入在 0（最近），越深越负 */
+function stZ(g){ return -g * STG.gateGap; }
+function stX(i){ const n = S.tokens.length; return (i - (n - 1) / 2) * STG.gapX; }
+function stHalfW(){ return Math.max(3.2, (S.tokens.length - 1) / 2 * STG.gapX + 1.38); }
+function stGateNow(){ return GATE_OF_STAGE[S.stage] || 0; }
+function anatTop(){ return stGateNow(); }
+/* 每颗珠子的大小：同一个词固定，越往里略小（远处的层更「抽象」） */
+function stR(i, g){
+  const h = mulberry32(seedOf(i, 7, (S.tokens[i] || '').length, 13))();
+  return (STG.r0 + 0.075 * h) * (1 - 0.030 * g);
+}
+/* 远处的整体压暗，冒充一点空气透视 */
+function stDepth(g){ return 1 - 0.075 * g; }
+
+/* 相机：沿着长廊看进去；词越多退越远 */
+function anatCameraTarget(stageIdx){
+  const zMid = (stZ(0) + stZ(N_GATE - 1)) / 2;
+  return { p: [1.5, 0.02, zMid], d: 25.6 + Math.max(0, S.tokens.length - 5) * 0.6 };
+}
+
+/* 圆角门框的路径（x-y 平面上的一个圆角矩形） */
+function gatePath(hw, hh, r, z, n){
+  n = n || 7;
+  const out = [];
+  const cs = [[hw - r, hh - r, 0], [-hw + r, hh - r, Math.PI / 2],
+              [-hw + r, -hh + r, Math.PI], [hw - r, -hh + r, Math.PI * 1.5]];
+  for (const c of cs){
+    for (let k = 0; k <= n; k++){
+      const a = c[2] + k / n * Math.PI / 2;
+      out.push([c[0] + Math.cos(a) * r, c[1] + Math.sin(a) * r, z]);
+    }
+  }
+  out.push(out[0].slice());
+  return out;
+}
+
+/* 一颗珠子：本体 + 柔光壳 + 选中时的金环 */
+function gateBead(g, i, hl, dim){
+  const x = stX(i), z = stZ(g), r = stR(i, g);
+  const isGen = i >= PROMPT_TOKENS.length;
+  const base = isGen ? SC.mal : C(TOK_COL[groupOf(S.tokens[i] || '')] || '#d9b56a', 1.0);
+  const col = mixC(base, SC.gold, hl * 0.42);
+  const a = clamp01(dim);
+  if (a <= 0.02) return;
+  sphere(BUF_OPAQUE, x, 0, z, r, [col[0], col[1], col[2], 0.98 * a], 0.10 + 0.55 * hl, 12, 7);
+  if (a > 0.35) sphere(BUF_GLASS, x, 0, z, r * 1.24, [base[0], base[1], base[2], (0.05 + 0.13 * hl) * a], 0.55, 9, 5);
+  if (hl > 0.30) ring3d(BUF_GLASS, x, 0, z, r * 1.30, 0.011, [SC.gold[0], SC.gold[1], SC.gold[2], (0.12 + 0.45 * hl) * a], 0.7, 22);
+}
+
+/* 星野：柜子外面那层细碎的光点（固定种子，不会闪） */
+function stageStars(){
+  const rnd = mulberry32(0x5EED17);
+  for (let k = 0; k < 150; k++){
+    const x = (rnd() - 0.5) * 52;
+    const y = (rnd() - 0.5) * 26 + 1.5;
+    const z = 8 - rnd() * 46;
+    const warm = rnd() > 0.68;
+    const c = warm ? C('#d9b56a', 0.55) : C('#a8c4f0', 0.45);
+    const s = 0.035 + rnd() * 0.045;
+    box(BUF_GLASS, x, y, z, s, s, s, c, 1);
+  }
+}
+
+/* 一块 Decoder 里：每根柱子分叉到 4 条头轨，再收回（v1 的「四头分叉」） */
+function blockFan(g, dim, active){
+  const n = S.tokens.length;
+  const zIn = stZ(g - 1), zOut = stZ(g), zMid = (zIn + zOut) / 2;
+  for (let i = 0; i < n; i++){
+    const x = stX(i);
+    for (let h = 0; h < NHEAD; h++){
+      const on = active && (S.head === h || S.head === 4);
+      const c0 = on ? HEAD_COL[h] : SC.goldSoft;
+      const a = (on ? 0.62 : 0.17) * dim;
+      const col = [c0[0], c0[1], c0[2], a];
+      const w = on ? 0.030 : 0.020;
+      ribbon(BUF_OPAQUE, [[x, 0, zIn], [x, HYN[h], zMid]], w, col, on ? 0.9 : 0.15);
+      ribbon(BUF_OPAQUE, [[x, HYN[h], zMid], [x, 0, zOut]], w, col, on ? 0.9 : 0.15);
+      /* 头轨上的小结节 */
+      box(BUF_OPAQUE, x, HYN[h], zMid, 0.055, 0.055, 0.055,
+          [c0[0], c0[1], c0[2], (on ? 0.75 : 0.22) * dim], on ? 0.8 : 0);
+    }
+  }
+}
+
+/* 一块 Decoder 的注意力弧（画在这块出口那道门上，珠子就在那里） */
+function stageArcs(g, dim, reveal){
+  const n = S.tokens.length;
+  const info = attention(g - 1, S.head >= 4 ? 0 : S.head, S.tokens);
+  const z = stZ(g) + 0.10;
+  for (let i = 0; i < n; i++){
+    for (let j = 0; j < i; j++){
+      const w = info.w[i][j];
+      if (!w || w < 0.03) continue;
+      const isQ = (S.qIdx < 0) || (i === S.qIdx);
+      const vis = clamp01(reveal * (n + 0.5) - i) * (isQ ? 1 : 0.12) * dim;
+      if (vis <= 0.02) continue;
+      const t = clamp01(Math.pow(w, 0.62) * 1.35);
+      const c0 = t < 0.62 ? mixC(SC.lapisSoft, SC.goldSoft, t / 0.62)
+                          : mixC(SC.gold, SC.cinSoft, (t - 0.62) / 0.38);
+      const col = [c0[0], c0[1], c0[2], c0[3] * vis];
+      const wd = 0.030 + 0.082 * Math.pow(w, 0.65);
+      arcBetween(BUF_OPAQUE, [stX(i), stR(i, g) * 0.75, z], [stX(j), stR(j, g) * 0.75, z],
+                 0.42 + 0.62 * w, wd, col, 0.80, 14);
+    }
+  }
+}
+
+/* 最后一道门上的概率柱 */
+function stageLogits(dim){
+  if (dim <= 0.02) return;
+  const n = S.tokens.length, z = stZ(N_GATE - 1);
+  const x0 = stX(n - 1);
+  const dist = probDist(S.gen), top = dist.list[0].p;
+  const bars = Math.min(6, dist.list.length);
+  for (let k = 0; k < bars; k++){
+    const p = dist.list[k].p;
+    const hh = 0.20 + 1.15 * (p / Math.max(0.01, top)) * dim;
+    box(BUF_OPAQUE, x0 + (k - (bars - 1) / 2) * 0.40, 0.60 + hh / 2, z + 0.35, 0.22, hh, 0.22,
+        k === 0 ? SC.gold : SC.lapisSoft, k === 0 ? 0.5 * dim : 0.08);
+  }
+}
+
+/* 主绘制：S.mode === 'anatomy' 时由 drawScene() 分派进来 */
+function drawAnatomy(pulse, st, prog){
+  const n = S.tokens.length;
+  const now = stGateNow();
+  const hw = stHalfW(), hh = STG.halfH;
+
+  /* ---- 外场：星野 + 地面藻井 + 涟漪 ---- */
+  stageStars();
+  dunhuangFloor(BUF_GLASS, STG.floorY, hw + 3.6, C('#d9b56a', 0.22), C('#d9b56a', 0.11), 1);
+  for (let k = 0; k < 3; k++){
+    const rr = 7.6 + k * 3.1, cz = stZ(N_GATE - 1) / 2, pts = [];
+    for (let m = 0; m <= 64; m++){
+      const a = m / 64 * Math.PI * 2;
+      pts.push([Math.cos(a) * rr, STG.floorY + 0.012, cz + Math.sin(a) * rr]);
+    }
+    ribbon(BUF_GLASS, pts, 0.012, C('#d9b56a', 0.13 - k * 0.03), 0);
+  }
+
+  /* ---- 一道道门 ---- */
+  for (let g = 0; g < N_GATE; g++){
+    const z = stZ(g);
+    const reached = g <= now, active = (g === now);
+    const dg = stDepth(g);
+    /* 门内的暖雾（展柜的灯）：只有柜内是暖的 */
+    const haze = (active ? 0.090 : (reached ? 0.050 : 0.020)) * dg;
+    quad(BUF_GLASS, [-hw, -hh, z], [hw, -hh, z], [hw, hh, z], [-hw, hh, z], C('#d9b56a', haze), 1);
+    /* 门框 */
+    ribbon(BUF_OPAQUE, gatePath(hw, hh, STG.rad, z, 7), active ? 0.052 : 0.030,
+           C('#d9b56a', (active ? 1.0 : (reached ? 0.56 : 0.24)) * dg), 1);
+    /* 门顶的灯带：v1 那种柜内暖光的光源感 */
+    beam(BUF_GLASS, -hw + 0.3, hh - 0.14, z, hw - 0.3, hh - 0.14, z, active ? 0.055 : 0.035,
+         C('#f4e2b4', (active ? 0.5 : 0.26) * dg), 1);
+    /* 门底的横档（像门槛） */
+    beam(BUF_OPAQUE, -hw, -hh, z, hw, -hh, z, active ? 0.030 : 0.018,
+         C('#d9b56a', (active ? 0.55 : 0.22) * dg), active ? 0.6 : 0);
+  }
+
+  /* ---- 纵向的柱 + 门与门之间的轨道 ---- */
+  for (let i = 0; i < n; i++){
+    const x = stX(i);
+    for (let g = 1; g < N_GATE; g++){
+      const reached = g <= now;
+      beam(BUF_OPAQUE, x, 0, stZ(g - 1), x, 0, stZ(g), 0.020,
+           [SC.goldSoft[0], SC.goldSoft[1], SC.goldSoft[2], (reached ? 0.34 : 0.13) * stDepth(g)], reached ? 0.35 : 0);
+    }
+  }
+
+  /* ---- 四块 Decoder：分叉 + 弧 ---- */
+  for (let g = 1; g <= 4; g++){
+    const reached = g <= now, active = (g === now);
+    const dim = (active ? 1 : (reached ? 0.55 : 0.10)) * stDepth(g);
+    blockFan(g, dim, active);
+    const reveal = active ? clamp01(0.70 + S.t / Math.max(0.7, st.dur * 0.7)) : 1;
+    /* 只画当前这一块的弧：四块同时画会糊成一团 */
+    if (g === now) stageArcs(g, dim, reveal);
+  }
+
+  /* ---- 每道门上的珠子 ---- */
+  for (let g = 0; g < N_GATE; g++){
+    const reached = g <= now, active = (g === now);
+    const dim = (active ? 1 : (reached ? 0.62 : 0.12)) * stDepth(g);
+    for (let i = 0; i < n; i++){
+      const q = (S.qIdx < 0) ? (i === n - 1) : (i === S.qIdx);
+      const hl = active ? (0.32 + 0.42 * pulse) * (q ? 1 : 0.55) : (reached ? 0.05 : 0);
+      gateBead(g, i, hl, dim);
+    }
+  }
+
+  /* ---- 输出门的概率柱 ---- */
+  if (now >= 5 && (st.id === 'final' || st.id === 'logits' || st.loop || st.id === 'pass')){
+    stageLogits(st.id === 'logits' ? clamp01(0.2 + S.t / Math.max(0.5, st.dur * 0.5)) : 1);
+  }
+
+  /* ---- 展示柜的外框：最靠前那圈粗金框，把整个场景「框」起来 ---- */
+  ribbon(BUF_OPAQUE, gatePath(hw + 0.42, hh + 0.42, STG.rad + 0.3, stZ(0) + 0.62, 8), 0.085,
+         C('#d9b56a', 0.40), 1);
+  
+
+  /* ---- 自回归：新词从输出门飞回嵌入门 ---- */
+  if (st.loop){
+    const k = clamp01((S.t - 1.0) / 1.7), e = ease(k);
+    if (k > 0.01){
+      const from = [stX(n - 1), 0, stZ(0)];
+      const to   = [stX(n - 1) + STG.gapX, 0, stZ(0)];
+      const gx = lerp(from[0], to[0], e);
+      sphere(BUF_GLASS, gx, 0, stZ(0) + 0.35, 0.30, [SC.mal[0], SC.mal[1], SC.mal[2], 0.55], 0.9, 11, 6);
+      ring3d(BUF_OPAQUE, gx, 0, stZ(0) + 0.35, 0.40, 0.012, [SC.mal[0], SC.mal[1], SC.mal[2], 0.9], 1, 22);
+    }
+  }
+}
+
+/* ---------------- 展廊的文字层 ---------------- */
+function addAnatLabels(){
+  /* 词名：贴在最近那道门（嵌入门）里的柱子下方 */
+  for (let i = 0; i < MAX_TOKENS; i++){
+    addLabel('lbl-sphere', '', () => {
+      if (S.mode !== 'anatomy' || i >= S.tokens.length) return null;
+      return [stX(i), -1.30, stZ(0) + 0.2];
+    }, 'center', i, 'anatomy');
+  }
+  /* 门的编号与名字：挂在每道门的左上角 */
+  for (let g = 0; g < N_GATE; g++){
+    addLabel('lbl-gate', GATE_LABEL[g], () => {
+      if (S.mode !== 'anatomy') return null;
+      if (Math.abs(g - stGateNow()) > 1) return null;
+      return [-stHalfW() - 0.30, STG.halfH + 0.30, stZ(g)];
+    }, 'right', null, 'anatomy');
+  }
+  /* 四个头的名字：只在「掩码多头自注意力」那一步显示，挂在当前块的中间 */
+  for (let h = 0; h < NHEAD; h++){
+    addLabel('lbl-head', HEAD_NAME[h], () => {
+      if (S.mode !== 'anatomy') return null;
+      const g = Math.max(1, Math.min(4, stGateNow()));
+      if (!STAGES[S.stage].mha) return null;
+      return [stHalfW() - 0.12, HYN[h], (stZ(g - 1) + stZ(g)) / 2];
+    }, 'right', null, 'anatomy');
+  }
+  addLabel('lbl-note', '残差流 → 一门一门往里走', () => {
+    if (S.mode !== 'anatomy' || stGateNow() < 1) return null;
+    return [-stHalfW() + 0.10, STG.floorY + 0.42, stZ(0) + 0.4];
+  }, 'left', null, 'anatomy');
+  addLabel('lbl-tiny', '弧 = 这一块的注意力 · 越粗越亮权重越大', () => {
+    if (S.mode !== 'anatomy') return null;
+    return [0, STG.halfH + 1.35, stZ(0)];
+  }, 'center', null, 'anatomy');
+}
+/* =====================================================================
+   §5  场景、状态机与交互
+   ---------------------------------------------------------------------
+   布局是「动态算出来的」：块 1 在演内部时会像抽屉一样拉开，其他块压缩，
+   所以每一帧都重新算一版 LAY（各模块的 y 坐标），再据此拼几何。
+   ===================================================================== */
+
+let W = 1, H = 1, DPR = 1, VIEW_DIST = 20;   // VIEW_DIST = 当前有效相机距离（2D 时会被拉大）
+
+const S = {
+  stage: 0,          // 当前阶段（0..11）
+  t: 0,              // 本阶段内已过秒数
+  playing: false,
+  speed: 1,
+  follow: true,
+  head: 0,           // 右侧选中的注意力头
+  gen: 0,            // 已经生成几个 token
+  tokens: PROMPT_TOKENS.slice(),
+  view2d: false,     // 是否 2D 视图（实际渲染用 viewT 做平滑过渡）
+  expandW: 0,        // 块 1 拉开进度 0..1
+  mhaE: 0,           // 注意力矩阵展开进度
+  mlpE: 0,           // MLP 展开进度
+  viewT: 0,          // 0=3D 1=2D
+  cubeFrom: [0,0,0],
+  pulse: 0,
+  mode: 'box',       // 'box' = 结构框图；'anatomy' = 向量解剖（两套视图共用同一套状态机）
+  qIdx: -1           // 解剖视图里的「查询位置」；-1 = 看全部行
+};
+
+/* 相机：az/el/zoom 由鼠标控制，tgt 由「跟随」自动对准当前模块 */
+const CAM = { az: 0.58, el: 0.26, zoom: 1, tgt: [0, 5.4, 0], dist: 20, fov: 42 };
+
+const LAY = { blocks: [], sub: {}, n: 5 };
+const COL = {
+  body:      C('#26334f', 0.96),
+  bodyEdge:  C('#6f92cc', 0.9),
+  subBody:   C('#2b3a5c', 0.97),
+  addBody:   C('#31405f', 0.97),
+  lnBody:    C('#2a3854', 0.97),
+  amber:     C('#d9b56a', 0.95),
+  amberSoft: C('#d9b56a', 0.35),
+  cyan:      C('#5b86d6', 0.95),
+  cyanSoft:  C('#5b86d6', 0.28),
+  green:     C('#2f9e86', 0.95),
+  rose:      C('#c8402f', 0.55),
+  ink:       C('#efe4cb', 0.9),
+  faint:     C('#6f7fa6', 0.55),
+  deep:      C('#141a2e', 0.92)
+};
+const BLOCK_W = 7.2, BLOCK_D = 2.6;
+
+/* ---------------- 布局 ---------------- */
+function computeLayout(){
+  const n = S.tokens.length;
+  LAY.n = n;
+  LAY.gap = 1.06; LAY.cube = 0.6;
+  LAY.tokY = 0.15;
+  LAY.tokX = i => (i - (n-1)/2) * LAY.gap;
+  LAY.embedY = 1.42;
+  LAY.embedW = Math.min(8.6, n*LAY.gap + 1.2);
+
+  const p = 0.30, hLN = 0.44, hADD = 0.44, g = 0.40;
+  const hMHA = 0.62 + 2.30 * S.mhaE;
+  const hMLP = 0.62 + 0.85 * S.mlpE;
+  const openH = 2*p + hLN + g + hMHA + g + hADD + g + hMLP + g + hADD;
+  const compactH = 1.04;
+
+  LAY.blocks = [];
+  let y = LAY.embedY + 0.21 + 0.66;
+  for (let i = 0; i < NBLOCK; i++){
+    const open = (i === 0) ? S.expandW : 0;
+    const h = lerp(compactH, openH, open);
+    LAY.blocks.push({ i, y0:y, y1:y+h, h, open, cx:0, cz:0 });
+    y += h + 0.34;
+  }
+  LAY.stackTop = y - 0.34;
+  LAY.dotsY = LAY.stackTop + 0.66;
+  LAY.finalY = LAY.dotsY + 0.96;
+  LAY.logitsY = LAY.finalY + 1.62;
+  LAY.openH = openH;
+
+  /* 块 1 内部的五个子模块（自下而上） */
+  let yy = LAY.blocks[0].y0 + p;
+  LAY.sub = {};
+  const add = (key, h) => { LAY.sub[key] = { y0:yy, y1:yy+h, cy:yy+h/2, h }; yy += h + g; };
+  add('ln1', hLN); add('mha', hMHA); add('add1', hADD); add('mlp', hMLP); add('add2', hADD);
+}
+
+/* 每个阶段「张量应该待在哪」 */
+function anchorOf(stageIdx, prog){
+  const b = LAY.blocks, n = LAY.n;
+  switch (stageIdx){
+    case 0:  return [LAY.tokX(n-1), LAY.tokY + 0.62, 1.0];
+    case 1:  return [0, LAY.embedY, 1.05];
+    case 2:  return [0, b[0].y0 + 0.34, 0.95];
+    case 3:  return [0, LAY.sub.ln1.cy, 1.6];
+    case 4:  return [0, LAY.sub.mha.cy, 1.65];
+    case 5:  return [0, LAY.sub.add1.cy, 1.6];
+    case 6:  return [0, LAY.sub.mlp.cy, 1.6];
+    case 7:  return [0, LAY.sub.add2.cy, 1.6];
+    case 8:  {                                     // 快速穿过第 2–4 块
+      const k = 1 + Math.min(NBLOCK-2, Math.floor(clamp01((prog-0.05)/0.66) * (NBLOCK-1)));
+      return [0, b[k].y0 + b[k].h/2, 0.95];
+    }
+    case 9:  return [0, LAY.finalY, 1.15];
+    case 10: return [0, LAY.logitsY, 1.35];
+    default: return [LAY.tokX(n-1), LAY.tokY + 0.62, 1.0];
+  }
+}
+/* 每个阶段相机该看哪（框图视图） */
+function cameraTargetOfBox(stageIdx){
+  const st = STAGES[stageIdx], b = LAY.blocks;
+  if (st.id === 'tokens') return { p:[0, 0.9, 0], d:12.5 };
+  if (st.id === 'embed')  return { p:[0, LAY.embedY + 0.3, 0], d:11.5 };
+  if (st.id === 'stack' || st.id === 'pass') return { p:[0, (b[0].y0 + LAY.logitsY + 1.6)/2, 0], d:Math.max(27, 3.6*LAY.stackTop/2.2) };
+  if (st.sub){
+    /* 窗口越矮，相机退得越远，保证模块框 + token 行 + 控制条都不打架 */
+    const d = 19.6 + Math.max(0, (900 - H) / 200) * 1.6;
+    return { p:[0, (LAY.sub.ln1.y0 + LAY.sub.add2.y1)/2 - 0.35, 0], d:d };
+  }
+  if (st.id === 'final') return { p:[0, LAY.finalY, 0], d:12.5 };
+  if (st.id === 'logits') return { p:[0, LAY.logitsY - 0.3, 0], d:14.5 };
+  if (st.id === 'loop')   return { p:[0, LAY.stackTop*0.55, 0], d:27 };
+  return { p:[0, 2.2, 0], d:14 };
+}
+
+/* 相机目标按当前视图分派（解剖视图的取景在 §3.2 / §5 里） */
+function cameraTargetOf(stageIdx){
+  return (S.mode === 'anatomy') ? anatCameraTarget(stageIdx) : cameraTargetOfBox(stageIdx);
+}
+
+/* ---------------- 文字层（3D 投影） ---------------- */
+const labelsEl = document.getElementById('labels');
+const LBL = [];
+function addLabel(cls, text, getPos, align, tokIdx, mode){
+  const el = document.createElement('div');
+  el.className = 'lbl ' + cls;
+  el.textContent = text;
+  labelsEl.appendChild(el);
+  const o = { el, getPos, align: align || 'center', tokIdx: (tokIdx === undefined ? null : tokIdx),
+              mode: mode || 'box', lastText: text };
+  LBL.push(o);
+  return o;
+}
+function updateLabels(){
+  for (let i = 0; i < LBL.length; i++){
+    const o = LBL[i];
+    /* 不属于当前视图的标签直接收起来（两套视图的标签共用这一个池子） */
+    if (o.mode !== S.mode){
+      o.el.style.opacity = '0';
+      o.el.style.transform = 'translate(-9999px,-9999px)';
+      continue;
+    }
+    /* token 标签的文字随生成过程变化 */
+    if (o.tokIdx !== null){
+      const t = S.tokens[o.tokIdx] || '';
+      if (t !== o.lastText){
+        o.lastText = t;
+        o.el.textContent = t;
+        o.el.classList.toggle('gen', o.tokIdx >= PROMPT_TOKENS.length);
+      }
+      /* 解剖视图里，被选中的「查询位置」把球名点亮 */
+      if (o.el.classList.contains('lbl-sphere')) o.el.classList.toggle('q', o.tokIdx === S.qIdx);
+    }
+    let pos = null;
+    try { pos = o.getPos(); } catch (e) { pos = null; }
+    const hide = () => {
+      o.el.style.opacity = '0';
+      o.el.style.transform = 'translate(-9999px,-9999px)';   // 移出画面，避免没定位过的标签堆在左上角
+    };
+    if (!pos){ hide(); continue; }
+    const s = project(pos);
+    if (!s || !isFinite(s.x) || !isFinite(s.y)){ hide(); continue; }
+    if (s.x < -160 || s.x > W + 160 || s.y < -90 || s.y > H + 90){ hide(); continue; }
+    const ax = o.align === 'right' ? ' translate(-100%,-50%)' : o.align === 'left' ? ' translate(0,-50%)' : ' translate(-50%,-50%)';
+    o.el.style.transform = 'translate(' + s.x.toFixed(1) + 'px,' + s.y.toFixed(1) + 'px)' + ax;
+    const far = 2.4 * VIEW_DIST;
+    const fade = s.depth > far ? Math.max(0, 1 - (s.depth - far) / (far * 0.5)) : 1;
+    o.el.style.opacity = String(0.16 + 0.84 * fade);
+  }
+}
+
+/* ---------------- 场景绘制 ---------------- */
+function drawScene(){
+  const b0 = LAY.blocks[0], open = S.expandW;
+  const st = STAGES[S.stage];
+  const pulse = 0.5 + 0.5 * Math.sin(S.pulse * 3.4);
+  const prog = S.t / st.dur;
+
+  /* ★ 两套视图的分派：解剖视图走自己的绘制（§5） */
+  if (S.mode === 'anatomy'){ drawAnatomy(pulse, st, prog); return; }
+
+  /* ---- token 方块 ---- */
+  for (let i = 0; i < LAY.n; i++){
+    const isGen = i >= PROMPT_TOKENS.length;
+    const cx = LAY.tokX(i), cy = LAY.tokY, s = LAY.cube;
+    const base = isGen ? C('#245347', 0.98) : C('#22345c', 0.98);
+    const hl = (st.id === 'tokens' || st.loop) ? 0.35 : 0;
+    box(BUF_OPAQUE, cx, cy, 0.6, s, s, s, mixC(base, COL.amber, hl * pulse), 0.05);
+    box(BUF_GLASS, cx, cy, 0.6, s*1.06, s*1.06, s*1.06, isGen ? C('#2f9e86', 0.16) : C('#5b86d6', 0.12), 0.6);
+  }
+
+  /* ---- 嵌入层 ---- */
+  const eHl = st.id === 'embed' ? (0.35 + 0.5*pulse) : 0;
+  box(BUF_OPAQUE, 0, LAY.embedY, 0, LAY.embedW, 0.42, 1.5, mixC(COL.body, COL.amber, eHl*0.28), eHl);
+  if (eHl > 0.05) wireBox(BUF_GLASS, 0, LAY.embedY, 0, LAY.embedW+0.16, 0.58, 1.66, 0.028, C('#d9b56a', 0.15+0.35*pulse), 1);
+  /* 位置编码小盒 */
+  const peX = LAY.embedW/2 + 0.55;
+  box(BUF_OPAQUE, peX, LAY.embedY, 0, 0.62, 0.42, 1.1, C('#28324c', 0.96), 0.05);
+
+  /* ---- Decoder 块 ---- */
+  for (let i = 0; i < NBLOCK; i++){
+    const b = LAY.blocks[i];
+    const isAct = (st.active === 'b' + i) || (st.active === 'b0' && i === 0);
+    const hl = isAct ? (0.30 + 0.55*pulse) : 0;
+    const cy = (b.y0 + b.y1)/2;
+    if (b.open > 0.02){
+      /* 打开状态：只留骨架 + 很淡的体块，让内部看得见 */
+      box(BUF_GLASS, 0, cy, 0, BLOCK_W, b.h, BLOCK_D, mixC(C('#141a2c', 0.10), COL.amber, hl*0.12), 0.02);
+      wireBox(BUF_GLASS, 0, cy, 0, BLOCK_W, b.h, BLOCK_D, 0.03, mixC(COL.bodyEdge, COL.amber, hl*0.9), hl > 0.05 ? 1 : 0.2);
+    } else {
+      box(BUF_OPAQUE, 0, cy, 0, BLOCK_W, b.h, BLOCK_D, mixC(COL.body, COL.amber, hl*0.14), hl);
+      box(BUF_GLASS, 0, cy, 0, BLOCK_W+0.14, b.h+0.1, BLOCK_D+0.14, mixC(C('#2a3450', 0.08), COL.amber, hl*0.4), 0.16);
+      if (hl > 0.05) wireBox(BUF_GLASS, 0, cy, 0, BLOCK_W+0.2, b.h+0.16, BLOCK_D+0.2, 0.03, C('#d9b56a', 0.2+0.5*pulse), 1);
+    }
+  }
+
+  /* ---- 块 1 内部：五个子模块 + 两条残差旁路 ---- */
+  if (open > 0.02){
+    const a = open;
+    const subHl = (key) => (st.sub === key ? (0.45 + 0.55*pulse) : 0);
+
+    /* LayerNorm ① */
+    let hl = subHl('ln1');
+    box(BUF_OPAQUE, 0, LAY.sub.ln1.cy, 0.5, 3.0, LAY.sub.ln1.h, 1.3, mixC(COL.lnBody, COL.amber, hl*0.26), hl, a);
+    if (hl > 0.05) wireBox(BUF_GLASS, 0, LAY.sub.ln1.cy, 0.5, 3.12, LAY.sub.ln1.h+0.1, 1.42, 0.022, C('#d9b56a', 0.25+0.5*pulse), 1);
+    /* 掩码多头自注意力 */
+    hl = subHl('mha');
+    box(BUF_OPAQUE, 0, LAY.sub.mha.cy, 0, 4.9, LAY.sub.mha.h, 2.0, mixC(COL.subBody, COL.amber, hl*0.24), hl, a);
+    if (hl > 0.05) wireBox(BUF_GLASS, 0, LAY.sub.mha.cy, 0, 5.02, LAY.sub.mha.h+0.1, 2.12, 0.022, C('#d9b56a', 0.22+0.45*pulse), 1);
+    /* Add & Norm ① */
+    hl = subHl('add1');
+    box(BUF_OPAQUE, 0, LAY.sub.add1.cy, 0.5, 3.0, LAY.sub.add1.h, 1.3, mixC(COL.addBody, COL.amber, hl*0.26), hl, a);
+    if (hl > 0.05) wireBox(BUF_GLASS, 0, LAY.sub.add1.cy, 0.5, 3.12, LAY.sub.add1.h+0.1, 1.42, 0.022, C('#d9b56a', 0.25+0.5*pulse), 1);
+    /* MLP */
+    hl = subHl('mlp');
+    box(BUF_OPAQUE, 0, LAY.sub.mlp.cy, 0, 4.6, LAY.sub.mlp.h, 2.0, mixC(COL.subBody, COL.amber, hl*0.24), hl, a);
+    if (hl > 0.05) wireBox(BUF_GLASS, 0, LAY.sub.mlp.cy, 0, 4.72, LAY.sub.mlp.h+0.1, 2.12, 0.022, C('#d9b56a', 0.22+0.45*pulse), 1);
+    /* Add & Norm ② */
+    hl = subHl('add2');
+    box(BUF_OPAQUE, 0, LAY.sub.add2.cy, 0.5, 3.0, LAY.sub.add2.h, 1.3, mixC(COL.addBody, COL.amber, hl*0.26), hl, a);
+    if (hl > 0.05) wireBox(BUF_GLASS, 0, LAY.sub.add2.cy, 0.5, 3.12, LAY.sub.add2.h+0.1, 1.42, 0.022, C('#d9b56a', 0.25+0.5*pulse), 1);
+
+    /* 五个子模块统一描一圈金边：暗底上才读得出每块的边界 */
+    for (const sb of [['ln1',0,0.5,3.0,1.3],['mha',0,0,4.9,2.0],['add1',0,0.5,3.0,1.3],
+                      ['mlp',0,0,4.6,2.0],['add2',0,0.5,3.0,1.3]]){
+      const s2 = LAY.sub[sb[0]];
+      wireBox(BUF_GLASS, sb[1], s2.cy, sb[2], sb[3]+0.05, s2.h+0.05, sb[4]+0.05,
+              0.012, C('#d9b56a', 0.36*a), 0.28);
+    }
+
+    /* 残差旁路：贴着模块左侧向上绕过去，再横向汇进 Add&Norm */
+    const xr = -2.86, zr = 1.42, xIn = -1.55;
+    const resC = C('#7f9fd0', 0.9*a);
+    const segs = [
+      [LAY.sub.ln1.y0 - 0.12, LAY.sub.add1.cy],   // 输入 → Add&Norm①
+      [LAY.sub.add1.cy, LAY.sub.add2.cy]          // Add&Norm① → Add&Norm②
+    ];
+    for (const seg of segs){
+      beam(BUF_OPAQUE, xIn, seg[0], 0.5, xr, seg[0], zr, 0.06, resC);
+      beam(BUF_OPAQUE, xr, seg[0], zr, xr, seg[1], zr, 0.06, resC);
+      beam(BUF_OPAQUE, xr, seg[1], zr, xIn, seg[1], 0.5, 0.06, resC);
+      box(BUF_OPAQUE, xIn+0.06, seg[1], 0.5, 0.18, 0.18, 0.18, C('#cfe0f8', 0.95*a), 0.25);
+    }
+
+    /* 子模块之间的竖向连接 */
+    const connC = C('#d9b56a', 0.55*a);
+    beam(BUF_OPAQUE, 0, LAY.sub.ln1.y1, 0.5, 0, LAY.sub.mha.y0, 0.5, 0.06, connC);
+    beam(BUF_OPAQUE, 0, LAY.sub.mha.y1, 0.5, 0, LAY.sub.add1.y0, 0.5, 0.08, connC);
+    beam(BUF_OPAQUE, 0, LAY.sub.add1.y1, 0.5, 0, LAY.sub.mlp.y0, 0.5, 0.08, connC);
+    beam(BUF_OPAQUE, 0, LAY.sub.mlp.y1, 0.5, 0, LAY.sub.add2.y0, 0.5, 0.08, connC);
+  }
+
+  /* ---- 块之间的竖向连接 ---- */
+  for (let i = 0; i + 1 < NBLOCK; i++){
+    const a = LAY.blocks[i], b = LAY.blocks[i+1];
+    beam(BUF_OPAQUE, 0, a.y1, 0, 0, b.y0, 0, 0.075, C('#d9b56a', 0.55));
+  }
+
+  /* ---- 「⋮ ×12」 ---- */
+  for (let k = 0; k < 3; k++){
+    const y = LAY.stackTop + 0.22 + k*0.19;
+    box(BUF_OPAQUE, 0, y, 0, 0.34, 0.09, 0.34, C('#2a3450', 0.9), 0.05);
+  }
+
+  /* ---- 最终 LayerNorm ---- */
+  const fHl = st.id === 'final' ? (0.35 + 0.55*pulse) : 0;
+  box(BUF_OPAQUE, 0, LAY.finalY, 0.4, 2.1, 0.34, 1.2, mixC(COL.lnBody, COL.amber, fHl*0.28), fHl);
+  if (fHl > 0.05) wireBox(BUF_GLASS, 0, LAY.finalY, 0.4, 2.3, 0.5, 1.4, 0.028, C('#d9b56a', 0.2+0.45*pulse), 1);
+
+  /* ---- Logits 面板 + 概率条 ---- */
+  const lHl = (st.id === 'logits' || st.loop) ? (0.3 + 0.45*pulse) : 0;
+  box(BUF_OPAQUE, 0, LAY.logitsY - 0.62, 0, 5.2, 0.16, 1.4, mixC(C('#1a2440', 0.95), COL.amber, lHl*0.4), lHl*0.5);
+  const dist = probDist(S.gen), top = dist.list[0].p;
+  const bars = Math.min(8, dist.list.length);
+  for (let k = 0; k < bars; k++){
+    const p = dist.list[k].p, hh = 0.28 + 1.35 * (p / top);
+    const bx = (k - (bars-1)/2) * 0.62;
+    const isTop = k === 0;
+    const col = isTop ? mixC(COL.amber, C('#f7ecd0', 1), lHl*0.3) : C('#3a5a8f', 0.95);
+    box(BUF_OPAQUE, bx, LAY.logitsY - 0.54 + hh/2, 0, 0.34, hh, 0.34, col, isTop ? (0.25 + 0.5*pulse*lHl) : 0.05);
+  }
+
+  /* ---- 注意力矩阵（贴在 MHA 盒子正面，先用深色底板再画格子，颜色才干净） ---- */
+  if (S.mhaE > 0.03){
+    const n = LAY.n, info = attention(0, S.head, S.tokens);
+    const cell = Math.min(0.46, 2.40 / Math.max(1, n)), gap = 0.06;
+    const gw = n*cell + (n-1)*gap;
+    const gx = 0.62, gy = LAY.sub.mha.cy, gz = 1.03;
+    const reveal = (st.sub === 'mha') ? clamp01(0.45 + S.t / (st.dur*0.7)) * (n + 1) : n + 1;
+    /* 底板：让格子的留缝是深色，而不是模块的蓝灰 */
+    box(BUF_OPAQUE, gx, gy, gz - 0.03, gw + 0.20, gw + 0.20, 0.02, C('#0a1120', 0.97 * S.mhaE), 0.02);
+    gridPanel(BUF_OPAQUE, gx, gy, gz, cell, gap, n, n, (r, c) => {
+      const vis = clamp01(reveal - r);
+      if (vis <= 0.02) return null;
+      if (info.masked[r][c]){
+        return { c:[0.36, 0.12, 0.17, 0.92 * vis * S.mhaE], g:0 };       // 被掩码：暗朱砂
+      }
+      const w = info.w[r][c];
+      const t = Math.pow(w, 0.55);
+      const cc = mixC(C('#24406b', 0.96), C('#f0d9a4', 1.0), t);
+      cc[3] = (0.55 + 0.45*t) * vis * S.mhaE;
+      return { c: cc, g: 0.18 + 0.5*t };
+    });
+    /* 矩阵外框（金线） */
+    wireBox(BUF_GLASS, gx, gy, gz, gw + 0.20, gw + 0.20, 0.02, 0.014, C('#d9b56a', 0.55*S.mhaE), 0.6);
+    /* 左边四条头轨：只有当前选中的那条亮 */
+    for (let h = 0; h < NHEAD; h++){
+      const hy = gy + 0.72 - h*0.44;
+      box(BUF_OPAQUE, -1.78, hy, 1.02, 0.34, 0.10, 0.05,
+          h === S.head ? C('#e8c78a', 1.0) : C('#2a3854', 0.95),
+          h === S.head ? 0.6 : 0.04, S.mhaE);
+    }
+  }
+
+  /* ---- MLP 三条柱状带（768 → 3072 → 768） ---- */
+  if (S.mlpE > 0.03){
+    const grow = (st.sub === 'mlp') ? ease(clamp01(S.t/(st.dur*0.7))) : 1;
+    const baseY = LAY.sub.mlp.cy - 0.34;
+    const groups = [
+      { x:-1.62, n:5, hMax:0.52, col:C('#3a5a8f', 0.95) },
+      { x: 0.00, n:9, hMax:0.95, col:C('#4a74b8', 0.95) },
+      { x: 1.62, n:5, hMax:0.52, col:C('#3a5a8f', 0.95) }
+    ];
+    const bw = 0.17, bgap = 0.085;
+    /* 底部基座，让柱子和"矩阵"感觉更清楚 */
+    box(BUF_OPAQUE, 0, baseY - 0.04, 1.06, 4.2, 0.06, 0.14, C('#1d2a4a', 0.9*S.mlpE), 0.05);
+    for (const g of groups){
+      for (let k = 0; k < g.n; k++){
+        const v = 0.30 + 0.70 * Math.abs(Math.sin(k*1.9 + g.n*0.7 + S.stage*0.6));
+        const hh = 0.10 + g.hMax * v * grow * S.mlpE;
+        const x = g.x + (k - (g.n-1)/2) * (bw + bgap);
+        box(BUF_OPAQUE, x, baseY + hh/2, 1.06, bw, hh, 0.10, g.col, 0.30);
+      }
+    }
+    /* 两组权重矩阵的箭头（细竖梁） */
+    box(BUF_OPAQUE, -0.82, baseY + 0.34, 1.06, 0.05, 0.68, 0.05, C('#b9cdf0', 0.5*S.mlpE), 0.1);
+    box(BUF_OPAQUE,  0.82, baseY + 0.34, 1.06, 0.05, 0.68, 0.05, C('#b9cdf0', 0.5*S.mlpE), 0.1);
+  }
+
+  /* ---- 正在搬运的张量：一个整体方块（没有粒子） ---- */
+  const target = anchorOf(S.stage, prog);
+  const tp = clamp01(S.t / 0.55);
+  const cube = [
+    lerp(S.cubeFrom[0], target[0], ease(tp)),
+    lerp(S.cubeFrom[1], target[1], ease(tp)),
+    lerp(S.cubeFrom[2], target[2], ease(tp))
+  ];
+  S.cube = cube;
+  const cs = 0.40;
+  box(BUF_GLASS, cube[0], cube[1], cube[2], cs, cs, cs, C('#5b86d6', 0.30), 0.9);
+  wireBox(BUF_OPAQUE, cube[0], cube[1], cube[2], cs*1.02, cs*1.02, cs*1.02, 0.02, C('#a8c4f0', 0.95), 1);
+
+  /* ---- 自回归：新的 token 从 logits 飞回句尾（绿色方块） ---- */
+  if (st.loop){
+    const k = clamp01((S.t - 1.1) / 1.6);
+    const from = [0, LAY.logitsY - 0.2, 1.1];
+    const to = [LAY.tokX(LAY.n) + 0.0, LAY.tokY, 0.6];
+    const e = ease(k);
+    const gx2 = lerp(from[0], to[0], e), gy2 = lerp(from[1], to[1], e), gz2 = lerp(from[2], to[2], e);
+    if (k > 0.01){
+      box(BUF_GLASS, gx2, gy2, gz2, 0.46, 0.46, 0.46, C('#2f9e86', 0.22 + 0.3*Math.sin(S.pulse*5)*0.5 + 0.15), 0.8);
+      wireBox(BUF_OPAQUE, gx2, gy2, gz2, 0.48, 0.48, 0.48, 0.02, C('#9fe8cc', 0.9), 1);
+    }
+  }
+}
+
+/* ---------------- 相机 ---------------- */
+function updateCamera(dt){
+  const st = STAGES[S.stage];
+  const ct = cameraTargetOf(S.stage);
+
+  if (S.follow){
+    const k = 1 - Math.exp(-dt * 3.2);
+    CAM.tgt[0] = lerp(CAM.tgt[0], ct.p[0], k);
+    CAM.tgt[1] = lerp(CAM.tgt[1], ct.p[1], k);
+    CAM.tgt[2] = lerp(CAM.tgt[2], ct.p[2], k);
+    CAM.dist = lerp(CAM.dist, ct.d, k);
+  } else {
+    CAM.dist = lerp(CAM.dist, CAM.baseDist || CAM.dist, 1 - Math.exp(-dt*3));
+  }
+
+  const fov0 = 42, fov1 = 3.4;
+  const fov = lerp(fov0, fov1, S.viewT) * Math.PI/180;
+  const distEff = CAM.dist * CAM.zoom * (Math.tan(fov0*Math.PI/360) / Math.tan(fov/2));
+  const az = lerp(CAM.az, 0.0001, S.viewT);
+  const el = lerp(CAM.el, 0.0001, S.viewT);
+  const eye = [
+    CAM.tgt[0] + distEff * Math.cos(el) * Math.sin(az),
+    CAM.tgt[1] + distEff * Math.sin(el),
+    CAM.tgt[2] + distEff * Math.cos(el) * Math.cos(az)
+  ];
+  VIEW_DIST = distEff;
+  m4persp(PROJ, fov, W/H, Math.max(0.1, distEff*0.01), distEff*8 + 200);
+  m4lookAt(VIEW, eye, CAM.tgt, [0,1,0]);
+  m4mul(VP, PROJ, VIEW);
+  return eye;
+}
+
+/* ---------------- 每帧 ---------------- */
+let LIVE_NODE = null;
+function frame(now){
+  const dt = Math.min(0.05, (now - (frame.last || now)) / 1000) || 0;
+  frame.last = now;
+  S.pulse += dt;
+
+  /* 时间推进 */
+  if (S.playing){
+    S.t += dt * S.speed;
+    const dur = STAGES[S.stage].dur;
+    if (S.t >= dur){ S.t = 0; advance(1); }
+  }
+
+  /* 展开进度 */
+  const st = STAGES[S.stage];
+  const wantOpen = st.sub ? 1 : 0;
+  S.expandW = lerp(S.expandW, wantOpen, 1 - Math.exp(-dt*5));
+  S.mhaE    = lerp(S.mhaE, st.id === 'mha' ? 1 : 0, 1 - Math.exp(-dt*5));
+  S.mlpE    = lerp(S.mlpE, st.id === 'mlp' ? 1 : 0, 1 - Math.exp(-dt*5));
+  S.viewT   = lerp(S.viewT, S.view2d ? 1 : 0, 1 - Math.exp(-dt*4));
+
+  computeLayout();
+  const eye = updateCamera(dt);
+  EYE[0] = eye[0]; EYE[1] = eye[1]; EYE[2] = eye[2];   // 弧线要朝着相机才好看
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.031, 0.024, 0.055, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(uVP, false, VP);
+  gl.uniform3fv(uEye, eye);
+
+  BUF_OPAQUE.n = 0; BUF_GLASS.n = 0;
+  drawScene();
+
+  gl.depthMask(true);
+  drawBuf(BUF_OPAQUE);
+  gl.depthMask(false);
+  drawBuf(BUF_GLASS);
+  gl.depthMask(true);
+
+  updateLabels();
+  updateHudLive();
+  if (LIVE_NODE) LIVE_NODE.textContent = JSON.stringify({
+    stage:S.stage, t:+S.t.toFixed(2),
+    tgt:[+CAM.tgt[0].toFixed(2), +CAM.tgt[1].toFixed(2), +CAM.tgt[2].toFixed(2)],
+    dist:+CAM.dist.toFixed(1), ex:+S.expandW.toFixed(2), mha:+S.mhaE.toFixed(2), mlp:+S.mlpE.toFixed(2),
+    view:+S.viewT.toFixed(2), n:LAY.n, tokens:S.tokens.slice(),
+    bh: LAY.blocks.map(b=>+b.h.toFixed(2)), subY: Object.keys(LAY.sub).map(k=>+LAY.sub[k].cy.toFixed(2)),
+    openH:+LAY.openH.toFixed(2), fov:+CAM.fov.toFixed(1), zoom:+CAM.zoom.toFixed(2)
+  });
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 阶段切换 ---------------- */
+function setStage(i, keepPlaying){
+  S.stage = ((i % STAGES.length) + STAGES.length) % STAGES.length;
+  S.t = 0;
+  S.cubeFrom = S.cube ? S.cube.slice() : anchorOf(S.stage, 0);
+  S.stageTimer = 0;
+  syncSide();
+  syncStageList();
+  syncDock();
+}
+function appendToken(){
+  if (S.tokens.length >= MAX_TOKENS){
+    S.tokens = PROMPT_TOKENS.slice();
+    S.gen = 0;
+    return false;
+  }
+  S.tokens.push(GEN_PLAN[S.gen % GEN_PLAN.length].w);
+  S.gen++;
+  return true;
+}
+function advance(dir){
+  const last = STAGES.length - 1;
+  if (dir > 0){
+    if (S.stage === last){          /* 走完一轮：追加 token，再从头跑（自回归） */
+      appendToken();
+      setStage(1);
+    } else setStage(S.stage + 1);
+  } else {
+    if (S.stage === 0) setStage(last);
+    else setStage(S.stage - 1);
+  }
+}
+
+/* ---------------- 右侧面板 ---------------- */
+const elBadge = document.getElementById('stBadge');
+const elTitle = document.getElementById('stTitle');
+const elText  = document.getElementById('stText');
+const elShape = document.getElementById('stShapes');
+const cardMha = document.getElementById('mhaCard');
+const cardMlp = document.getElementById('mlpCard');
+const cardProb = document.getElementById('probsCard');
+const cardStack = document.getElementById('stackCard');
+const tblBox  = document.getElementById('attnTbl');
+const headTabs = document.getElementById('headTabs');
+const probsList = document.getElementById('probsList');
+const elModeText = document.getElementById('modeText');
+const elAnatCard = document.getElementById('anatCard');
+const qTabsEl = document.getElementById('qTabs');
+const eqBar = document.getElementById('eqBar');
+const eqLH = document.getElementById('eqLH');
+
+function syncSide(){
+  const st = STAGES[S.stage];
+  elBadge.textContent = st.badge;
+  elTitle.textContent = st.title;
+  elText.innerHTML = st.text;
+
+  const parts = String(st.shapes).split('→');
+  elShape.innerHTML = parts.map((s, i) =>
+    (i ? '<span class="ar">→</span>' : '') + '<span class="s">' + esc(s.trim()) + '</span>'
+  ).join('');
+
+  cardMha.style.display = st.mha ? 'block' : 'none';
+  if (eqBar){
+    eqBar.classList.toggle('on', !!st.mha);
+    if (st.mha) eqLH.textContent = 'L' + (S.mode === 'anatomy' ? Math.max(1, Math.min(4, stGateNow())) : 1) + ' · H' + ((S.head >= 4 ? 0 : S.head) + 1);
+  }
+  cardMlp.style.display = st.mlp ? 'block' : 'none';
+  cardProb.style.display = st.probs ? 'block' : 'none';
+  cardStack.style.display = (st.id === 'stack' || st.id === 'pass') ? 'block' : 'none';
+
+  if (st.mha) syncAttnTable();
+  if (st.probs) syncProbs();
+  syncModePanel();
+}
+
+/* ---------------- 视图说明卡 + 查询词 ---------------- */
+let qTabSeen = -1;
+function syncModePanel(){
+  const box = (S.mode === 'box');
+  elModeText.innerHTML = box
+    ? '整页默认是 <b>结构框图</b>：一摞模块 + 一个张量方块，按「下一步」看数据一格一格往上搬，' +
+      '到哪个模块哪个模块亮。想看清 token 之间怎么交换信息，切到 <b>向量解剖</b>。'
+    : '现在是 <b>词珠长廊</b>（照第一版的「门廊」做的）：一道门是一层，门一道套一道往深处退；' +
+      '每颗珠子是一个 token 在该层的 768 维向量，珠子串在柱子上就是<b>残差流</b>，门里那几条拱起的弧是<b>注意力</b>' +
+      '（越粗越亮权重越大）。走一步，往里多开一道门；下面可以选一个词，只看它把注意力投给了谁。';
+  elAnatCard.style.display = box ? 'none' : 'block';
+  document.getElementById('modeBtnBox').classList.toggle('on', box);
+  document.getElementById('modeBtnAnat').classList.toggle('on', !box);
+  document.getElementById('legendBox').style.display  = box ? 'flex' : 'none';
+  document.getElementById('legendAnat').style.display = box ? 'none' : 'flex';
+  buildQTabs();
+  syncQTabs();
+}
+function buildQTabs(){
+  const n = S.tokens.length;
+  if (n === qTabSeen) return;
+  qTabSeen = n;
+  qTabsEl.innerHTML = '';
+  const mk = (label, idx) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = () => { S.qIdx = idx; syncQTabs(); };
+    qTabsEl.appendChild(b);
+    return b;
+  };
+  mk('全部', -1);
+  for (let i = 0; i < n; i++) mk(S.tokens[i], i);
+  if (S.qIdx >= n) S.qIdx = -1;
+}
+function syncQTabs(){
+  if (!qTabsEl) return;
+  const bs = qTabsEl.querySelectorAll('button');
+  bs.forEach((b, k) => b.classList.toggle('on', (k === 0 && S.qIdx < 0) || (k - 1 === S.qIdx)));
+}
+function syncAttnTable(){
+  const n = LAY.n || S.tokens.length, info = attention(0, S.head, S.tokens);
+  let h = '<table class="attn"><tr><th>Q\\K</th>';
+  for (let j = 0; j < n; j++) h += '<th>' + esc(S.tokens[j]) + '</th>';
+  h += '</tr>';
+  for (let i = 0; i < n; i++){
+    h += '<tr><th>' + esc(S.tokens[i]) + '</th>';
+    let mx = -1, arg = 0;
+    for (let j = 0; j < n; j++) if (info.w[i][j] > mx){ mx = info.w[i][j]; arg = j; }
+    for (let j = 0; j < n; j++){
+      if (info.masked[i][j]) h += '<td class="msk">·</td>';
+      else if (j === arg) h += '<td class="hot">' + info.w[i][j].toFixed(2) + '</td>';
+      else h += '<td>' + info.w[i][j].toFixed(2) + '</td>';
+    }
+    h += '</tr>';
+  }
+  h += '</table>';
+  tblBox.innerHTML = h;
+}
+function syncProbs(){
+  const dist = probDist(S.gen);
+  let h = '';
+  for (let i = 0; i < Math.min(5, dist.list.length); i++){
+    const r = dist.list[i];
+    h += '<div class="prow' + (i === 0 ? ' top' : '') + '">' +
+         '<span class="w">' + esc(r.w) + '</span>' +
+         '<span class="bar"><i style="width:' + (r.p*100/Math.max(0.01,dist.list[0].p)).toFixed(1) + '%"></i></span>' +
+         '<span class="v">' + (r.p*100).toFixed(1) + '%</span></div>';
+  }
+  h += '<div class="prow"><span class="w" style="color:var(--faint)">其他</span>' +
+       '<span class="bar"><i style="width:' + (dist.rest*100/Math.max(0.01,dist.list[0].p)).toFixed(1) + '%;background:rgba(120,190,255,.3)"></i></span>' +
+       '<span class="v">' + (dist.rest*100).toFixed(0) + '%</span></div>';
+  probsList.innerHTML = h;
+}
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+/* ---------------- 阶段表 / 控制条同步 ---------------- */
+const stageListEl = document.getElementById('stageList');
+const stageBtns = [];
+function buildStageList(){
+  for (let i = 0; i < STAGES.length; i++){
+    const b = document.createElement('button');
+    b.innerHTML = '<span class="n">' + String(i+1).padStart(2,'0') + '</span>' + esc(STAGES[i].name);
+    b.onclick = () => { S.playing = false; setStage(i); syncDock(); };
+    stageListEl.appendChild(b);
+    stageBtns.push(b);
+  }
+}
+function syncStageList(){
+  stageBtns.forEach((b, i) => b.classList.toggle('on', i === S.stage));
+}
+const btnPlay = document.getElementById('btnPlay');
+const progFill = document.getElementById('progFill');
+const stepNo = document.getElementById('stepNo');
+function syncDock(){
+  btnPlay.textContent = S.playing ? '❚❚ 暂停' : '▶ 播放';
+  btnPlay.classList.toggle('on', S.playing);
+  stepNo.textContent = String(S.stage+1).padStart(2,'0') + '/' + STAGES.length;
+  document.getElementById('btn2d').classList.toggle('on', S.view2d);
+  document.getElementById('btnFollow').classList.toggle('on', S.follow);
+}
+function updateHudLive(){
+  progFill.style.width = (clamp01(S.t / STAGES[S.stage].dur) * 100).toFixed(1) + '%';
+}
+
+/* ---------------- 交互 ---------------- */
+let drag = null;
+canvas.addEventListener('pointerdown', e => {
+  drag = { x:e.clientX, y:e.clientY };
+  canvas.classList.add('dragging');
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  drag.x = e.clientX; drag.y = e.clientY;
+  CAM.az -= dx * 0.006;
+  CAM.el = Math.max(-0.35, Math.min(1.25, CAM.el + dy * 0.005));
+  if (S.view2d){ S.view2d = false; syncDock(); }   // 在 2D 里拖动 → 回到 3D
+});
+canvas.addEventListener('pointerup', e => { drag = null; canvas.classList.remove('dragging'); });
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  CAM.zoom = Math.max(0.45, Math.min(2.2, CAM.zoom * (1 + Math.sign(e.deltaY) * 0.08)));
+}, { passive:false });
+
+function togglePlay(){ S.playing = !S.playing; syncDock(); }
+document.getElementById('btnPlay').onclick = togglePlay;
+document.getElementById('btnNext').onclick = () => { S.playing = false; advance(1); syncDock(); };
+document.getElementById('btnPrev').onclick = () => { S.playing = false; advance(-1); syncDock(); };
+document.getElementById('btnReset').onclick = () => {
+  S.tokens = PROMPT_TOKENS.slice(); S.gen = 0; S.playing = false;
+  CAM.az = 0.58; CAM.el = 0.26; CAM.zoom = 1; CAM.dist = 20; CAM.tgt = [0, 5.4, 0];
+  S.view2d = false; S.follow = true;
+  setStage(0); syncDock();
+};
+document.getElementById('btn2d').onclick = () => { S.view2d = !S.view2d; syncDock(); };
+
+/* ---------- 两套视图切换（框图 / 解剖）---------- */
+function setMode(m){
+  if (S.mode === m) return;
+  S.mode = m;
+  S.cubeFrom = S.cube ? S.cube.slice() : S.cubeFrom;
+  CAM.az = (m === 'anatomy') ? 0.115 : 0.58;
+  CAM.el = (m === 'anatomy') ? 0.105 : 0.26;
+  snapView();
+  syncSide(); syncDock();
+}
+document.getElementById('modeBtnBox').onclick  = () => setMode('box');
+document.getElementById('modeBtnAnat').onclick = () => setMode('anatomy');
+document.getElementById('btnModeBox').onclick  = () => { setMode('box'); };
+document.getElementById('btnModeAnat').onclick = () => { setMode('anatomy'); };
+document.getElementById('btnFollow').onclick = () => {
+  S.follow = !S.follow;
+  if (!S.follow) CAM.baseDist = CAM.dist;
+  syncDock();
+};
+document.getElementById('speed').oninput = e => { S.speed = parseFloat(e.target.value); };
+document.getElementById('btnHelp').onclick = () => document.getElementById('help').classList.add('on');
+document.getElementById('btnArch').onclick = () => document.getElementById('arch').classList.add('on');
+document.querySelectorAll('[data-close]').forEach(b => {
+  b.onclick = () => document.getElementById(b.getAttribute('data-close')).classList.remove('on');
+});
+document.querySelectorAll('.overlay').forEach(o => {
+  o.addEventListener('click', e => { if (e.target === o) o.classList.remove('on'); });
+});
+
+/* 注意力头切换按钮 */
+(function buildHeadTabs(){
+  for (let h = 0; h < NHEAD; h++){
+    const b = document.createElement('button');
+    b.textContent = 'H' + (h+1);
+    b.title = HEAD_SPEC[h].name + '：' + HEAD_SPEC[h].desc;
+    b.onclick = () => { S.head = h; syncHeads(); syncAttnTable(); };
+    headTabs.appendChild(b);
+  }
+})();
+function syncHeads(){
+  const bs = headTabs.querySelectorAll('button');
+  bs.forEach((b, i) => b.classList.toggle('on', i === S.head));
+}
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space'){ e.preventDefault(); togglePlay(); return; }
+  if (e.key === 'ArrowRight'){ S.playing = false; advance(1); syncDock(); }
+  if (e.key === 'ArrowLeft'){ S.playing = false; advance(-1); syncDock(); }
+  if (e.key === '1'){ S.view2d = false; syncDock(); }
+  if (e.key === 'm' || e.key === 'M'){ setMode(S.mode === 'box' ? 'anatomy' : 'box'); }
+  if (e.key === '2'){ S.view2d = true; syncDock(); }
+  if (e.key === 'f' || e.key === 'F'){ document.getElementById('btnFollow').click(); }
+  if (e.key === 'r' || e.key === 'R'){ document.getElementById('btnReset').click(); }
+  if (e.key === 'h' || e.key === 'H'){ document.getElementById('help').classList.toggle('on'); }
+  if (e.key === 'q' || e.key === 'Q'){ S.head = (S.head + NHEAD - 1) % NHEAD; syncHeads(); syncAttnTable(); }
+  if (e.key === 'e' || e.key === 'E'){ S.head = (S.head + 1) % NHEAD; syncHeads(); syncAttnTable(); }
+});
+
+/* ---------------- 尺寸 ---------------- */
+function resize(){
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.floor(W * DPR);
+  canvas.height = Math.floor(H * DPR);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+}
+window.addEventListener('resize', resize);
+
+/* ---------------- 启动 ---------------- */
+/* 把相机与展开进度瞬间对齐到当前阶段（截图 / 直接定位用） */
+function snapView(){
+  computeLayout();
+  const ct = cameraTargetOf(S.stage);
+  CAM.tgt[0] = ct.p[0]; CAM.tgt[1] = ct.p[1]; CAM.tgt[2] = ct.p[2];
+  CAM.dist = ct.d;
+  const st = STAGES[S.stage];
+  S.expandW = st.sub ? 1 : 0;
+  S.mhaE = (st.id === 'mha') ? 1 : 0;
+  S.mlpE = (st.id === 'mlp') ? 1 : 0;
+  S.viewT = S.view2d ? 1 : 0;
+}
+
+function boot(){
+  resize();
+  initGL();
+  computeLayout();          // 先算一版布局，后面 setStage / 锚点都依赖它
+  buildStageList();
+  syncHeads();
+  /* 3D 文字层：模块名 / 形状 / token / 提示 */
+  const b = () => LAY.blocks;
+  addLabel('lbl-note', '↑ 张量自下而上 · 逐层前向传播', () => [-4.35, LAY.tokY + 1.0, 1.2], 'right');
+  for (let i = 0; i < MAX_TOKENS; i++){
+    addLabel('lbl-tok', '', () => {
+      if (i >= LAY.n) return null;
+      return [LAY.tokX(i), LAY.tokY - 0.62, 0.6];
+    }, 'center', i);
+  }
+  addLabel('lbl-mod', 'Token 嵌入 + 位置编码', () => [-LAY.embedW/2 - 0.3, LAY.embedY, 0.5], 'right');
+  addLabel('lbl-shape', '[n × 768]', () => [LAY.embedW/2 + 0.9, LAY.embedY, 0.2], 'left');
+  for (let i = 0; i < NBLOCK; i++){
+    addLabel('lbl-mod', 'Decoder 块 ' + (i+1), () => {
+      const bb = LAY.blocks[i];
+      if (bb.open > 0.35) return null;                  // 打开时用子模块标签
+      return [0, (bb.y0 + bb.y1)/2, BLOCK_D/2 + 0.1];
+    });
+  }
+  addLabel('lbl-note', '⋮ 共 12 层', () => [0.75, LAY.dotsY, 0]);
+  addLabel('lbl-mod', '最终 LayerNorm', () => [0, LAY.finalY + 0.42, 0.4]);
+  addLabel('lbl-mod', 'Logits → softmax', () => [0, LAY.logitsY + 1.18, 0]);
+  addLabel('lbl-shape', '下一个 token 概率', () => [0, LAY.logitsY + 0.72, 0]);
+
+  /* 子模块标签：统一排到块的外左侧，右对齐，绝不会压在模块上 */
+  const subLbl = (key, text) => addLabel('lbl-mod', text, () => {
+    if (S.expandW < 0.45) return null;
+    return [-3.82, LAY.sub[key].cy, 1.3];
+  }, 'right');
+  subLbl('ln1', '① LayerNorm · 逐位置归一化');
+  subLbl('mha', '② 掩码多头自注意力 ×4 头');
+  subLbl('add1', '③ 残差相加 + LayerNorm');
+  subLbl('mlp', '④ MLP · 768→3072→768');
+  subLbl('add2', '⑤ 残差相加 + LayerNorm → 下一块');
+
+  addLabel('lbl-tiny', '行 = 查询 ↓  列 = 键 →', () => {
+    if (S.mhaE < 0.4) return null;
+    const n = LAY.n, c2 = Math.min(0.46, 2.40/Math.max(1,n)), gw = n*c2 + (n-1)*0.06;
+    return [0.62 - gw/2 + 0.02, LAY.sub.mha.cy + gw/2 + 0.34, 1.05];
+  }, 'left');
+  addLabel('lbl-tiny', '右上角 = 被掩码的未来', () => {
+    if (S.mhaE < 0.4) return null;
+    const n = LAY.n, c2 = Math.min(0.46, 2.40/Math.max(1,n)), gw = n*c2 + (n-1)*0.06;
+    return [0.62 - gw/2 + 0.02, LAY.sub.mha.cy - gw/2 - 0.34, 1.05];
+  }, 'left');
+
+  /* 解剖视图的文字层（词名 / 层名 / 提示），默认隐藏，切过去才显示 */
+  addAnatLabels();
+
+  syncSide();
+  syncStageList();
+  syncDock();
+  setStage(0);
+
+  /* 允许用 URL 参数直接定帧（上课复位 / 截图核对用）：
+     index.html?stage=5&view=2d&mode=anatomy&head=2&flow=0.6&play=0          */
+  const q = new URLSearchParams(location.search);
+  if (q.get('view') === '2d'){ S.view2d = true; S.viewT = 1; }
+  if (q.get('mode') === 'anatomy' || q.get('mode') === 'anat'){ S.mode = 'anatomy'; CAM.az = 0.115; CAM.el = 0.105; }
+  if (q.has('head')) S.head = Math.max(0, Math.min(NHEAD-1, parseInt(q.get('head'),10) || 0));
+  /* ?q=2 ：解剖视图里锁定第 3 个词当查询位置（-1 = 全部行） */
+  if (q.has('q')) S.qIdx = Math.max(-1, Math.min(S.tokens.length-1, parseInt(q.get('q'),10)));
+  if (q.has('stage')){
+    const si = Math.max(0, Math.min(STAGES.length-1, parseInt(q.get('stage'),10) || 0));
+    setStage(si);
+    if (q.has('flow')) S.t = STAGES[si].dur * Math.max(0, Math.min(0.99, parseFloat(q.get('flow')) || 0));
+  }
+  if (q.get('play') === '1') S.playing = true;
+  if (q.get('open')){ const ov = document.getElementById(q.get('open')); if (ov) ov.classList.add('on'); }
+  if (q.has('speed')) S.speed = Math.max(0.2, Math.min(4, parseFloat(q.get('speed')) || 1));
+  /* step=N：打开时直接往后走 N 步（深链/自检用，等价于点 N 次「下一步」） */
+  if (q.has('step')){
+    const nStep = Math.max(0, Math.min(40, parseInt(q.get('step'),10) || 0));
+    for (let i = 0; i < nStep; i++) advance(1);
+    snapView();
+  }
+  if (q.has('zoom')) CAM.zoom = Math.max(0.45, Math.min(2.2, parseFloat(q.get('zoom')) || 1));
+  /* 带 stage 参数打开（上课复位 / 截图核对）：把所有过渡直接推到目标值 */
+  if (q.has('stage')) snapView();
+  else if (STAGES[S.stage].sub) S.expandW = 1;
+  syncHeads(); syncSide(); syncStageList(); syncDock();
+  /* 调试用：把当前状态写进隐藏节点（自检 / 截图核对时读它） */
+  LIVE_NODE = document.createElement('pre');
+  LIVE_NODE.id = 'live'; LIVE_NODE.style.display = 'none';
+  document.body.appendChild(LIVE_NODE);
+  requestAnimationFrame(frame);
+
+  /* 自检信息：写进隐藏节点，方便无头浏览器/自动化核对 */
+  const diag = document.createElement('pre');
+  diag.id = 'diag'; diag.style.display = 'none';
+  const a0 = attention(0, 0, PROMPT_TOKENS);
+  diag.textContent = JSON.stringify({
+    stages: STAGES.map(s => s.id),
+    blocks: NBLOCK, realLayers: REAL_LAYERS, heads: NHEAD, dk: DK, dmodel: DMODEL, dff: DFF,
+    tokens: PROMPT_TOKENS,
+    mode: S.mode, gates: N_GATE, gateGap: STG.gateGap, gateOfStage: GATE_OF_STAGE, gateNow: stGateNow(),
+    beadPos: S.tokens.map((t, i) => [+stX(i).toFixed(2), +stZ(0).toFixed(2), +stR(i, 0).toFixed(2)]),
+    attn_rowsums: a0.w.map(r => +r.reduce((x,y)=>x+y,0).toFixed(6)),
+    attn_l1_h1: a0.w.map(r => r.map(v => +v.toFixed(3))),
+    masked_upper_zero: a0.w.every((r,i) => r.every((v,j) => j <= i || v === 0)),
+    probs_top: probDist(0).list.slice(0,3),
+    webgl2: !!gl,
+    renderer: (function(){ try { const e = gl.getExtension('WEBGL_debug_renderer_info'); return e ? gl.getParameter(e.UNMASKED_RENDERER_WEBGL) : 'n/a'; } catch(e){ return 'n/a'; } })()
+  });
+  document.body.appendChild(diag);
+  /* ---------- 自检：?test=1 时用真实点击把两套视图、2D、查询词、换头都走一遍 ---------- */
+  if (q.get('test') === '1'){
+    const log = [];
+    const snap = tag => log.push({
+      tag: tag, mode: S.mode, view2d: S.view2d, stage: S.stage, qIdx: S.qIdx, head: S.head,
+      shownLabels: LBL.filter(o => o.el.style.opacity && o.el.style.opacity !== '0').length,
+      canon: +document.getElementById('stepNo').textContent.slice(0,2),
+      anatTop: anatTop()
+    });
+    snap('init');
+    document.getElementById('btnModeAnat').click();  snap('anat');
+    document.getElementById('btn2d').click();        snap('2d');
+    document.getElementById('btnNext').click();      snap('next');
+    const qb = qTabsEl.querySelectorAll('button');
+    if (qb[2]) qb[2].click();                        snap('qchip');
+    const htb = headTabs.querySelectorAll('button');
+    if (htb[2]) htb[2].click();                      snap('head3');
+    document.getElementById('btnModeBox').click();   snap('box');
+    document.getElementById('btnPrev').click();      snap('prev');
+    document.getElementById('btnModeAnat').click();  snap('anat2d-box?');
+    const tn = document.createElement('pre');
+    tn.id = 'test'; tn.style.display = 'none';
+    tn.textContent = JSON.stringify(log);
+    document.body.appendChild(tn);
+  }
+
+  window.__ready = true;
+}
+
+window.addEventListener('error', ev => fatal('脚本出错：' + ev.message + '\n' + (ev.filename||'') + ':' + (ev.lineno||'')));
+try { boot(); } catch (e){ fatal('初始化失败：\n' + (e && e.stack || e)); }
+</script>
+</body>
+</html>
